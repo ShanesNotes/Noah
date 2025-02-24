@@ -1,32 +1,22 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex};
-use tokio_tungstenite::connect_async;
-use futures_util::StreamExt;
 use sqlx::SqlitePool;
-use flexi_logger::{colored_detailed_format, Duplicate, Logger, WriteMode};
-use prometheus::{IntCounterVec, Registry, Encoder, TextEncoder};
 use clap::{Parser, Subcommand};
 use anyhow::{Result, Error};
-use hyper::{Body, Request, Response, Server};
-use hyper::service::{make_service_fn, service_fn};
-use std::convert::Infallible;
 use rig_core::agent::{Agent, AgentBuilder};
-use rig_mongodb::MongoDBClient;
-use rig_postgres::PostgresClient;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Serialize, Deserialize};
+use async_trait::async_trait;
 
-// Mock GeminiModel (replace with actual implementation)
+trait CompletionModel: Send + Sync {}
 #[derive(Clone)]
 struct GeminiModel;
 impl CompletionModel for GeminiModel {}
 
-// Placeholder traits and modules
-trait CompletionModel: Send + Sync {}
-mod arc_framework {
-    pub async fn log_to_blockchain(_action: &str, _patient_id: &str, _data: &str) -> Result<(), anyhow::Error> {
-        Ok(()) // Placeholder
+mod external_apis {
+    pub async fn text_to_speech(text: &str, language: &str) -> String {
+        format!("[Voice in {}] {}", language, text)
     }
 }
 
@@ -35,41 +25,123 @@ struct PatientChart {
     patient_id: String,
 }
 
-impl PatientChart {
-    fn new(patient_id: String) -> Self {
-        PatientChart { patient_id }
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct PatientTask {
+    id: u32,
+    patient_id: String,
+    description: String,
+    severity: u8,
+    time_due: SystemTime,
+}
+
+#[derive(Clone)]
+struct UserPreferences {
+    language: String,
+    voice_enabled: bool,
+}
+
+enum AgentMode {
+    Nurse,
+    Patient,
+}
+
+#[async_trait]
+trait Tool: Send + Sync {
+    async fn execute(&self, input: &str) -> Result<String, Error>;
+}
+
+struct VitalsChecker;
+#[async_trait]
+impl Tool for VitalsChecker {
+    async fn execute(&self, _input: &str) -> Result<String, Error> {
+        Ok("HR: 72, SpO2: 98".to_string())
+    }
+}
+
+struct ChartAssessment;
+#[async_trait]
+impl Tool for ChartAssessment {
+    async fn execute(&self, input: &str) -> Result<String, Error> {
+        Ok(format!("Assessment for {}: Stable.", input))
+    }
+}
+
+struct RecordIO;
+#[async_trait]
+impl Tool for RecordIO {
+    async fn execute(&self, input: &str) -> Result<String, Error> {
+        Ok(format!("I/O for {}: Intake 500ml, Output 400ml.", input))
+    }
+}
+
+struct CheckLabValues;
+#[async_trait]
+impl Tool for CheckLabValues {
+    async fn execute(&self, input: &str) -> Result<String, Error> {
+        Ok(format!("Labs for {}: Glucose 95.", input))
+    }
+}
+
+struct AdministerMedication;
+#[async_trait]
+impl Tool for AdministerMedication {
+    async fn execute(&self, input: &str) -> Result<String, Error> {
+        Ok(format!("Administered to {}: Aspirin 81mg.", input))
+    }
+}
+
+struct AnalyzeTestResults;
+#[async_trait]
+impl Tool for AnalyzeTestResults {
+    async fn execute(&self, input: &str) -> Result<String, Error> {
+        Ok(format!("Results for {}: Normal.", input))
+    }
+}
+
+struct HospitalNetwork {
+    messages: Arc<Mutex<Vec<(String, String, String)>>>,
+}
+
+impl HospitalNetwork {
+    fn new() -> Self {
+        Self { messages: Arc::new(Mutex::new(Vec::new())) }
+    }
+    async fn send_message(&self, from: &str, to: &str, message: &str) {
+        self.messages.lock().unwrap().push((from.to_string(), to.to_string(), message.to_string()));
     }
 }
 
 #[derive(Parser)]
-#[command(name = "Noah", about = "Critical Care Nurse AI Agent Toolkit")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
     #[arg(long, default_value = "sqlite")]
     db_type: String,
+    #[arg(long, default_value = "nurse")]
+    mode: String,
+    #[arg(long)]
+    voice: bool,
 }
 
 #[derive(Subcommand)]
 enum Commands {
     MonitorVitals { patient_id: String },
-    MonitorVitalsStream { 
-        patient_id: String, 
-        #[arg(long)] worker_count: Option<usize>, 
-        #[arg(long)] buffer_size: Option<usize> 
-    },
 }
 
 enum DatabaseBackend {
     SQLite(SqlitePool),
-    MongoDB(MongoDBClient),
-    Postgres(PostgresClient),
 }
 
+#[derive(Clone)]
 struct NoahAgent<M: CompletionModel> {
     chart: Arc<PatientChart>,
     rig_agent: Agent<M>,
     db: DatabaseBackend,
+    preferences: UserPreferences,
+    mode: AgentMode,
+    tools: HashMap<String, Arc<dyn Tool>>,
+    task_queue: Arc<Mutex<VecDeque<PatientTask>>>,
+    hospital_network: HospitalNetwork,
 }
 
 impl<M: CompletionModel + Send + Sync> NoahAgent<M> {
@@ -79,167 +151,91 @@ impl<M: CompletionModel + Send + Sync> NoahAgent<M> {
         model: M,
         db_type: &str,
         db_url: &str,
+        mode: AgentMode,
+        voice_enabled: bool,
     ) -> Result<Self> {
         let rig_agent = AgentBuilder::new(model)
-            .preamble("You are Noah, a critical care nurse AI.")
+            .preamble("You are Noah, a healthcare AI.")
             .context(&training_data.join("\n"))
             .build();
-
         let db = match db_type {
             "sqlite" => DatabaseBackend::SQLite(SqlitePool::connect(db_url).await?),
-            "mongodb" => DatabaseBackend::MongoDB(MongoDBClient::new(db_url)?),
-            "postgres" => DatabaseBackend::Postgres(PostgresClient::new(db_url)?),
-            _ => return Err(anyhow::anyhow!("Unsupported database type: {}", db_type)),
+            _ => return Err(anyhow::anyhow!("Unsupported DB_TYPE: {}", db_type)),
         };
-
-        Ok(NoahAgent { chart, rig_agent, db })
+        let tools = HashMap::from([
+            ("vitals_checker".to_string(), Arc::new(VitalsChecker) as Arc<dyn Tool>),
+            ("chart_assessment".to_string(), Arc::new(ChartAssessment) as Arc<dyn Tool>),
+            ("record_io".to_string(), Arc::new(RecordIO) as Arc<dyn Tool>),
+            ("check_lab_values".to_string(), Arc::new(CheckLabValues) as Arc<dyn Tool>),
+            ("administer_medication".to_string(), Arc::new(AdministerMedication) as Arc<dyn Tool>),
+            ("analyze_test_results".to_string(), Arc::new(AnalyzeTestResults) as Arc<dyn Tool>),
+        ]);
+        Ok(Self {
+            chart,
+            rig_agent,
+            db,
+            preferences: UserPreferences { language: "English".to_string(), voice_enabled },
+            mode,
+            tools,
+            task_queue: Arc::new(Mutex::new(VecDeque::new())),
+            hospital_network: HospitalNetwork::new(),
+        })
     }
 
-    async fn update_vitals(&self, vitals: HashMap<String, f32>) -> Result<()> {
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-        match &self.db {
-            DatabaseBackend::SQLite(pool) => {
-                for (key, value) in &vitals {
-                    sqlx::query("INSERT INTO vitals (patient_id, timestamp, key, value) VALUES (?, ?, ?, ?)")
-                        .bind(&self.chart.patient_id)
-                        .bind(timestamp)
-                        .bind(key)
-                        .bind(value)
-                        .execute(pool)
-                        .await?;
-                }
-            }
-            DatabaseBackend::MongoDB(client) => {
-                client.collection("vitals_stream")
-                    .insert_one(doc! {
-                        "patient_id": &self.chart.patient_id,
-                        "timestamp": timestamp,
-                        "vitals": serde_json::to_value(&vitals)?
-                    }, None)
-                    .await?;
-            }
-            DatabaseBackend::Postgres(client) => {
-                for (key, value) in &vitals {
-                    client.execute(
-                        "INSERT INTO vitals (patient_id, timestamp, key, value) VALUES ($1, $2, $3, $4)",
-                        &[&self.chart.patient_id, &timestamp, &key, &value]
-                    ).await?;
-                }
-            }
-        }
-        let data = serde_json::to_string(&vitals)?;
-        arc_framework::log_to_blockchain("Update Vitals", &self.chart.patient_id, &data).await?;
+    async fn monitor_vitals(&self) -> Result<String> {
+        let checker = self.tools.get("vitals_checker").unwrap();
+        let vitals = checker.execute(&self.chart.patient_id).await?;
+        let response = match self.mode {
+            AgentMode::Nurse => format!("Vitals for nurse review: {}", vitals),
+            AgentMode::Patient => format!("Your vitals are: {}", vitals),
+        };
+        Ok(if self.preferences.voice_enabled {
+            external_apis::text_to_speech(&response, &self.preferences.language).await
+        } else {
+            response
+        })
+    }
+
+    async fn add_task(&self, description: &str, severity: u8) -> Result<()> {
+        let task = PatientTask {
+            id: self.task_queue.lock().unwrap().len() as u32 + 1,
+            patient_id: self.chart.patient_id.clone(),
+            description: description.to_string(),
+            severity,
+            time_due: SystemTime::now() + Duration::from_secs(3600),
+        };
+        self.task_queue.lock().unwrap().push_back(task);
         Ok(())
     }
-}
 
-async fn run_vitals_stream(
-    patient_id: String,
-    worker_count: usize,
-    buffer_size: usize,
-    agent: NoahAgent<GeminiModel>,
-) -> Result<()> {
-    let _logger = Logger::try_with_env_or_str("info")?
-        .format(colored_detailed_format)
-        .write_mode(WriteMode::Async)
-        .duplicate_to_stdout(Duplicate::Info)
-        .start()?;
-
-    let registry = Registry::new();
-    let metrics = IntCounterVec::new(
-        prometheus::Opts::new("vitals_processed", "Number of vital sign updates processed"),
-        &["patient_id"],
-    )?;
-    registry.register(Box::new(metrics.clone()))?;
-
-    let (ws_stream, _) = connect_async("ws://websocket-server:8080/vitals").await?;
-    let (_, mut ws_receiver) = ws_stream.split();
-
-    let (tx, rx) = mpsc::channel::<HashMap<String, f32>>(buffer_size);
-    let rx = Arc::new(Mutex::new(rx));
-
-    let workers: Vec<_> = (0..worker_count)
-        .map(|_| {
-            let rx = Arc::clone(&rx);
-            let agent = agent.clone(); // Assuming clonable for simplicity
-            let metrics = metrics.clone();
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_millis(100));
-                while let Some(vitals) = rx.lock().await.recv().await {
-                    interval.tick().await;
-                    if let Err(e) = agent.update_vitals(vitals).await {
-                        log::error!("Failed to process vitals: {}", e);
-                    }
-                    metrics.with_label_values(&[&agent.chart.patient_id]).inc();
-                }
-            })
-        })
-        .collect();
-
-    let receiver = tokio::spawn(async move {
-        while let Some(message) = ws_receiver.next().await {
-            match message {
-                Ok(msg) if msg.is_text() => {
-                    if let Ok(vitals) = serde_json::from_str(msg.to_text()?) {
-                        let _ = tx.send(vitals).await;
-                    }
-                }
-                Ok(_) => log::warn!("Non-text message received"),
-                Err(e) => log::error!("WebSocket error: {}", e),
-            }
-        }
-    });
-
-    let metrics_server = tokio::spawn(async move {
-        async fn metrics_handler(_req: Request<Body>) -> Result<Response<Body>, Infallible> {
-            let encoder = TextEncoder::new();
-            let metric_families = prometheus::gather();
-            let mut buffer = Vec::new();
-            encoder.encode(&metric_families, &mut buffer)?;
-            Ok(Response::new(Body::from(buffer)))
-        }
-
-        let make_svc = make_service_fn(|_conn| async { Ok::<_, Infallible>(service_fn(metrics_handler)) });
-        let server = Server::bind(&([0, 0, 0, 0], 9090).into()).serve(make_svc);
-        if let Err(e) = server.await {
-            log::error!("Metrics server error: {}", e);
-        }
-    });
-
-    receiver.await??;
-    metrics_server.await??;
-    for worker in workers {
-        worker.await??;
+    async fn prioritize_tasks(&self) -> Result<String> {
+        let mut queue = self.task_queue.lock().unwrap().clone();
+        queue.make_contiguous().sort_by(|a, b| b.severity.cmp(&a.severity));
+        Ok(queue.front().map_or("No tasks".to_string(), |t| t.description.clone()))
     }
-    Ok(())
 }
 
-#[tokio::main(flavor = "multi_thread")]
+#[tokio::main]
 async fn main() -> Result<(), Error> {
-    dotenv::dotenv().ok();
     let cli = Cli::parse();
-
     let patient_id = match &cli.command {
         Commands::MonitorVitals { patient_id } => patient_id.clone(),
-        Commands::MonitorVitalsStream { patient_id, .. } => patient_id.clone(),
     };
-    let chart = Arc::new(PatientChart::new(patient_id));
-    let gemini_model = GeminiModel; // Placeholder
-    let training_data = vec!["Default training data for Noah".to_string()];
-    let db_url = match cli.db_type.as_str() {
-        "sqlite" => "/app/noah.db",
-        "mongodb" => &std::env::var("MONGO_URL").unwrap_or("mongodb://mongodb:27017/noah".to_string()),
-        "postgres" => &std::env::var("POSTGRES_URL").unwrap_or("postgres://noah_user:noah_pass@postgres:5432/noah_db".to_string()),
-        _ => return Err(anyhow::anyhow!("Unsupported DB_TYPE: {}", cli.db_type)),
+    let chart = Arc::new(PatientChart { patient_id });
+    let gemini_model = GeminiModel;
+    let training_data = vec!["Default training data".to_string()];
+    let mode = match cli.mode.as_str() {
+        "nurse" => AgentMode::Nurse,
+        "patient" => AgentMode::Patient,
+        _ => AgentMode::Nurse,
     };
-    let agent = NoahAgent::new_with_db(chart, training_data, gemini_model, &cli.db_type, db_url).await?;
+    let agent = NoahAgent::new_with_db(chart, training_data, gemini_model, &cli.db_type, "noah.db", mode, cli.voice).await?;
 
     match cli.command {
-        Commands::MonitorVitals { patient_id } => {
-            println!("Monitoring vitals for patient: {}", patient_id);
-        }
-        Commands::MonitorVitalsStream { patient_id, worker_count, buffer_size } => {
-            run_vitals_stream(patient_id, worker_count.unwrap_or(4), buffer_size.unwrap_or(100), agent).await?;
+        Commands::MonitorVitals { patient_id: _ } => {
+            agent.add_task("Check vitals", 5).await?;
+            println!("Task: {}", agent.prioritize_tasks().await?);
+            println!("Vitals: {}", agent.monitor_vitals().await?);
         }
     }
     Ok(())
