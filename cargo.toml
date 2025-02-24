@@ -1,0 +1,36 @@
+[package]
+name = "Noah"
+version = "0.1.0"
+edition = "2021"
+description = "Critical Care Nurse AI Agent Toolkit using Gemini and Rig"
+authors = ["Shane McCusker <smccusker22@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/shanesnotes/noah"
+homepage = "https://github.com/shanesnotes/noah"
+documentation = "https://docs.rs/noah"
+readme = "README.md"
+keywords = ["AI", "Nurse", "Critical Care", "Toolkit", "Rust"]
+categories = ["healthcare", "artificial-intelligence", "utilities"]
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+clap = { version = "4.0", features = ["derive"] }
+sha2 = "0.10"
+rand = { version = "0.8", features = ["small_rng"] }
+rig-core = "0.9.0"
+rig-mock = "0.9.0"
+rig-mongodb = "0.9.0"
+rig-postgres = "0.9.0"
+reqwest = { version = "0.11", features = ["json"] }
+serde_json = "1.0"
+anyhow = "1.0"
+async-trait = "0.1"
+dotenv = "0.15"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[features]
+default = ["full"]
+full = ["tokio/full", "serde/derive", "clap/derive", "rand/small_rng"]
