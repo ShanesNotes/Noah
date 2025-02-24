@@ -13,15 +13,23 @@ keywords = ["AI", "Nurse", "Critical Care", "Toolkit", "Rust"]
 categories = ["healthcare", "artificial-intelligence", "utilities"]
 
 [dependencies]
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.23"
+futures-util = "0.3"
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite"] }
+flexi_logger = "0.28"
+prometheus = "0.13"
+hyper = { version = "0.14", features = ["server", "http1"] }
+serde_json = "1"
+dotenv = "0.15"
 serde = { version = "1.0", features = ["derive"] }
 clap = { version = "4.0", features = ["derive"] }
 sha2 = "0.10"
 rand = { version = "0.8", features = ["small_rng"] }
 rig-core = "0.9.0"
-rig-mock = "0.9.0"
-rig-mongodb = "0.9.0"
-rig-postgres = "0.9.0"
+rig-mock = { version = "0.9.0", optional = true }
+rig-mongodb = { version = "0.9.0", optional = true }
+rig-postgres = { version = "0.9.0", optional = true }
 reqwest = { version = "0.11", features = ["json"] }
 serde_json = "1.0"
 anyhow = "1.0"
@@ -32,5 +40,9 @@ dotenv = "0.15"
 tokio-test = "0.4"
 
 [features]
-default = ["full"]
+default = ["sqlite"]
+mock = ["rig-mock"]
+mongodb = ["rig-mongodb"]
+postgres = ["rig-postgres"]
+sqlite = ["sqlx"]
 full = ["tokio/full", "serde/derive", "clap/derive", "rand/small_rng"]
