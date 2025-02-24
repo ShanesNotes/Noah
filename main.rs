@@ -1,87 +1,44 @@
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime};
-use tokio;
-use serde::{Serialize, Deserialize};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc, Mutex};
+use tokio_tungstenite::connect_async;
+use futures_util::StreamExt;
+use sqlx::SqlitePool;
+use flexi_logger::{colored_detailed_format, Duplicate, Logger, WriteMode};
+use prometheus::{IntCounterVec, Registry, Encoder, TextEncoder};
 use clap::{Parser, Subcommand};
-use rig_core::{agent::AgentBuilder, completion::{CompletionModel, CompletionRequest, CompletionResponse, Message, CompletionError}};
-use reqwest::Client;
-use serde_json::json;
-use anyhow::{bail, Result, Error};
-use dotenv::dotenv;
+use anyhow::{Result, Error};
+use hyper::{Body, Request, Response, Server};
+use hyper::service::{make_service_fn, service_fn};
+use std::convert::Infallible;
+use rig_core::agent::{Agent, AgentBuilder};
+use rig_mongodb::MongoDBClient;
+use rig_postgres::PostgresClient;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+// Mock GeminiModel (replace with actual implementation)
+#[derive(Clone)]
+struct GeminiModel;
+impl CompletionModel for GeminiModel {}
+
+// Placeholder traits and modules
+trait CompletionModel: Send + Sync {}
 mod arc_framework {
-    use sha2::{Sha256, Digest};
-    use anyhow::{Result, Error};
-
-    pub async fn log_to_blockchain(action: &str, patient_id: &str, data: &str) -> Result<String, Error> {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        let hash = format!("{:x}", hasher.finalize());
-        Ok(format!("Logged to ARC blockchain: {} for {} with hash {}", action, patient_id, hash))
+    pub async fn log_to_blockchain(_action: &str, _patient_id: &str, _data: &str) -> Result<(), anyhow::Error> {
+        Ok(()) // Placeholder
     }
 }
 
-mod external_apis {
-    use std::collections::HashMap;
-    use rand::Rng;
-    use anyhow::{Result, Error};
-
-    pub async fn fetch_vitals(patient_id: &str) -> Result<HashMap<String, f32>, Error> {
-        println!("SIMULATION: Fetching vitals for {}. Requires Philips integration.", patient_id);
-        let mut rng = rand::thread_rng();
-        let mut vitals = HashMap::from([
-            ("HR".to_string(), rng.gen_range(60.0..100.0)),
-            ("SpO2".to_string(), rng.gen_range(90.0..100.0)),
-            ("RR".to_string(), rng.gen_range(12.0..20.0)),
-            ("NIBP".to_string(), rng.gen_range(90.0..140.0)),
-            ("ABP".to_string(), rng.gen_range(70.0..90.0)),
-            ("CVP".to_string(), rng.gen_range(2.0..8.0)),
-        ]);
-        if patient_id == "P003" {
-            vitals.insert("PAP".to_string(), rng.gen_range(15.0..30.0));
-        }
-        Ok(vitals)
-    }
-
-    pub async fn fetch_labs(patient_id: &str) -> Result<HashMap<String, f32>, Error> {
-        println!("SIMULATION: Fetching labs for {}. Requires Epic integration.", patient_id);
-        Ok(HashMap::from([
-            ("creatinine".to_string(), 1.2),
-            ("glucose".to_string(), 95.0),
-        ]))
-    }
-
-    pub async fn log_to_ehr(patient_id: &str, action: &str, data: &str) -> Result<String, Error> {
-        println!("SIMULATION: Logging '{}' for {}. Requires Epic API.", action, patient_id);
-        Ok(format!("Logged to EHR: {} - {}", action, data))
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct PatientChart {
     patient_id: String,
-    vitals: HashMap<String, f32>,
-    labs: HashMap<String, f32>,
-    meds: Vec<Medication>,
-    tasks: Vec<PatientTask>,
-    notes: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct Medication {
-    name: String,
-    dose: f32,
-    route: String,
-    time_due: SystemTime,
-    parameters: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct PatientTask {
-    id: u32,
-    description: String,
-    severity: u8,
-    due_time: SystemTime,
+impl PatientChart {
+    fn new(patient_id: String) -> Self {
+        PatientChart { patient_id }
+    }
 }
 
 #[derive(Parser)]
@@ -89,287 +46,201 @@ struct PatientTask {
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+    #[arg(long, default_value = "sqlite")]
+    db_type: String,
 }
 
 #[derive(Subcommand)]
 enum Commands {
     MonitorVitals { patient_id: String },
-    ReviewMeds { patient_id: String },
-    ChartAssessment { patient_id: String, assessment: String },
-    ChartVitals { patient_id: String },
-    ChartIO { patient_id: String, intake: f32, output: f32 },
-    MonitorLabs { patient_id: String },
-    AddTask { patient_id: String, task: String, severity: u8, due_hours: u32 },
-    LogNote { patient_id: String, note: String },
+    MonitorVitalsStream { 
+        patient_id: String, 
+        #[arg(long)] worker_count: Option<usize>, 
+        #[arg(long)] buffer_size: Option<usize> 
+    },
 }
 
-// Custom Gemini model using Google's Gemini API
-#[derive(Clone)]
-struct GeminiModel {
-    client: Client,
-    api_key: String,
-    model: String,
-}
-
-impl GeminiModel {
-    fn new(api_key: String, model: String) -> Self {
-        GeminiModel {
-            client: Client::new(),
-            api_key,
-            model,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl CompletionModel for GeminiModel {
-    type Response = CompletionResponse<Message>;
-
-    fn completion(&self, request: CompletionRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, CompletionError>> + Send>> {
-        let client = self.client.clone();
-        let api_key = self.api_key.clone();
-        let model = self.model.clone();
-        let prompt = request.prompt;
-
-        Box::pin(async move {
-            let response = client
-                .post(format!("https://generativelanguage.googleapis.com/v1/models/{}:generateContent", model))
-                .header("x-goog-api-key", &api_key)
-                .json(&json!({
-                    "contents": [
-                        {
-                            "parts": [
-                                {"text": prompt}
-                            ]
-                        }
-                    ],
-                    "generationConfig": {
-                        "temperature": 0.7,
-                        "maxOutputTokens": 150
-                    }
-                }))
-                .send()
-                .await
-                .map_err(|e| CompletionError::Request(e.to_string()))?;
-
-            let json: serde_json::Value = response
-                .json()
-                .await
-                .map_err(|e| CompletionError::Parse(e.to_string()))?;
-
-            let content = json["candidates"][0]["content"]["parts"][0]["text"]
-                .as_str()
-                .ok_or_else(|| CompletionError::Parse("No text in Gemini response".to_string()))?
-                .to_string();
-
-            Ok(CompletionResponse {
-                choice: Message {
-                    role: "assistant".to_string(),
-                    content,
-                },
-                raw_response: prompt,
-            })
-        })
-    }
+enum DatabaseBackend {
+    SQLite(SqlitePool),
+    MongoDB(MongoDBClient),
+    Postgres(PostgresClient),
 }
 
 struct NoahAgent<M: CompletionModel> {
-    chart: PatientChart,
-    rig_agent: rig_core::agent::Agent<M>,
+    chart: Arc<PatientChart>,
+    rig_agent: Agent<M>,
+    db: DatabaseBackend,
 }
 
-impl<M: CompletionModel> NoahAgent<M> {
-    fn new(chart: PatientChart, training_data: Vec<String>, model: M) -> Self {
+impl<M: CompletionModel + Send + Sync> NoahAgent<M> {
+    async fn new_with_db(
+        chart: Arc<PatientChart>,
+        training_data: Vec<String>,
+        model: M,
+        db_type: &str,
+        db_url: &str,
+    ) -> Result<Self> {
         let rig_agent = AgentBuilder::new(model)
-            .preamble("You are Noah, a critical care nurse AI assisting RNs with empathy and precision.")
+            .preamble("You are Noah, a critical care nurse AI.")
             .context(&training_data.join("\n"))
             .build();
-        NoahAgent { chart, rig_agent }
-    }
 
-    async fn monitor_vitals(&mut self) -> Result<String, Error> {
-        let vitals = external_apis::fetch_vitals(&self.chart.patient_id).await?;
-        println!("DEBUG: Fetched vitals: {:?}", vitals);
-        self.chart.vitals = vitals.clone();
-        let mut response = String::new();
-        for (key, value) in &vitals {
-            let norm = match key.as_str() {
-                "HR" => (60.0, 100.0),
-                "SpO2" => (90.0, 100.0),
-                "RR" => (12.0, 20.0),
-                "NIBP" => (90.0, 140.0),
-                "ABP" => (70.0, 90.0),
-                "CVP" => (2.0, 8.0),
-                "PAP" => (15.0, 30.0),
-                _ => (0.0, 0.0),
-            };
-            let status = if *value < norm.0 || *value > norm.1 { "abnormal" } else { "normal" };
-            response.push_str(&format!("{}: {} ({}), ", key, value, status));
-        }
-        self.log_to_ehr("Vitals Monitored", &response).await?;
-        Ok(format!("[SIMULATED DATA] {}", response.trim_end_matches(", ")))
-    }
-
-    async fn review_meds(&mut self) -> Result<String, Error> {
-        let vitals = external_apis::fetch_vitals(&self.chart.patient_id).await?;
-        self.chart.vitals = vitals.clone();
-        let mut response = String::new();
-        for med in &self.chart.meds {
-            let hr = vitals.get("HR").unwrap_or(&0.0);
-            let recommendation = if med.parameters.contains("Hold if HR < 60") && *hr < 60.0 {
-                "Hold recommended"
-            } else {
-                "Administer as ordered"
-            };
-            response.push_str(&format!("{}: {} ({}), ", med.name, med.parameters, recommendation));
-        }
-        self.log_to_ehr("Medication Review", &response).await?;
-        Ok(format!("[SIMULATED DATA] {}", response.trim_end_matches(", ")))
-    }
-
-    async fn chart_assessment(&mut self, assessment: &str) -> Result<String, Error> {
-        let vitals = external_apis::fetch_vitals(&self.chart.patient_id).await?;
-        self.chart.vitals = vitals.clone();
-        let context = serde_json::to_string(&self.chart)?;
-        let prompt = format!(
-            "You are Noah, a critical care nurse AI. Based on this patient data: {}, refine this assessment into a concise, professional note: {}",
-            context, assessment
-        );
-        let llm_response = self.rig_agent.completion(prompt.into()).await?;
-        let refined_assessment = llm_response.choice.content;
-        let response = format!("Assessment: {}", refined_assessment);
-        self.log_to_ehr("Chart Assessment", &response).await?;
-        self.log_to_arc("Chart Assessment", &response).await?;
-        Ok(format!("[LLM-ENHANCED] {}", response))
-    }
-
-    async fn chart_vitals(&mut self) -> Result<String, Error> {
-        let vitals = external_apis::fetch_vitals(&self.chart.patient_id).await?;
-        self.chart.vitals = vitals.clone();
-        let response = vitals.iter().map(|(k, v)| format!("{}: {}", k, v)).collect::<Vec<String>>().join(", ");
-        self.log_to_ehr("Chart Vitals", &response).await?;
-        self.log_to_arc("Chart Vitals", &response).await?;
-        Ok(format!("[SIMULATED DATA] {}", response))
-    }
-
-    async fn chart_io(&mut self, intake: f32, output: f32) -> Result<String, Error> {
-        let response = format!("Intake: {} mL, Output: {} mL", intake, output);
-        self.log_to_ehr("Chart I&O", &response).await?;
-        self.log_to_arc("Chart I&O", &response).await?;
-        Ok(format!("[SIMULATED DATA] {}", response))
-    }
-
-    async fn monitor_labs(&mut self) -> Result<String, Error> {
-        let labs = external_apis::fetch_labs(&self.chart.patient_id).await?;
-        self.chart.labs = labs.clone();
-        let response = labs.iter().map(|(k, v)| format!("{}: {}", k, v)).collect::<Vec<String>>().join(", ");
-        self.log_to_ehr("Monitor Labs", &response).await?;
-        Ok(format!("[SIMULATED DATA] {}", response))
-    }
-
-    async fn add_task(&mut self, task: String, severity: u8, due_hours: u32) -> Result<String, Error> {
-        let task = PatientTask {
-            id: self.chart.tasks.len() as u32 + 1,
-            description: task.clone(),
-            severity,
-            due_time: SystemTime::now() + Duration::from_secs(due_hours as u64 * 3600),
+        let db = match db_type {
+            "sqlite" => DatabaseBackend::SQLite(SqlitePool::connect(db_url).await?),
+            "mongodb" => DatabaseBackend::MongoDB(MongoDBClient::new(db_url)?),
+            "postgres" => DatabaseBackend::Postgres(PostgresClient::new(db_url)?),
+            _ => return Err(anyhow::anyhow!("Unsupported database type: {}", db_type)),
         };
-        self.chart.tasks.push(task.clone());
-        let response = format!("Added task: {} (Severity: {})", task.description, task.severity);
-        self.log_to_ehr("Add Task", &response).await?;
-        Ok(format!("[SIMULATED DATA] {}", response))
+
+        Ok(NoahAgent { chart, rig_agent, db })
     }
 
-    async fn log_provider_note(&mut self, note: &str) -> Result<String, Error> {
-        self.chart.notes.push(note.to_string());
-        let response = format!("Provider Note: {}", note);
-        self.log_to_ehr("Log Provider Note", &response).await?;
-        self.log_to_arc("Log Provider Note", &response).await?;
-        Ok(format!("[SIMULATED DATA] {}", response))
-    }
-
-    async fn log_to_ehr(&self, action: &str, data: &str) -> Result<String, Error> {
-        external_apis::log_to_ehr(&self.chart.patient_id, action, data).await
-    }
-
-    async fn log_to_arc(&self, action: &str, data: &str) -> Result<String, Error> {
-        arc_framework::log_to_blockchain(action, &self.chart.patient_id, data).await
+    async fn update_vitals(&self, vitals: HashMap<String, f32>) -> Result<()> {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        match &self.db {
+            DatabaseBackend::SQLite(pool) => {
+                for (key, value) in &vitals {
+                    sqlx::query("INSERT INTO vitals (patient_id, timestamp, key, value) VALUES (?, ?, ?, ?)")
+                        .bind(&self.chart.patient_id)
+                        .bind(timestamp)
+                        .bind(key)
+                        .bind(value)
+                        .execute(pool)
+                        .await?;
+                }
+            }
+            DatabaseBackend::MongoDB(client) => {
+                client.collection("vitals_stream")
+                    .insert_one(doc! {
+                        "patient_id": &self.chart.patient_id,
+                        "timestamp": timestamp,
+                        "vitals": serde_json::to_value(&vitals)?
+                    }, None)
+                    .await?;
+            }
+            DatabaseBackend::Postgres(client) => {
+                for (key, value) in &vitals {
+                    client.execute(
+                        "INSERT INTO vitals (patient_id, timestamp, key, value) VALUES ($1, $2, $3, $4)",
+                        &[&self.chart.patient_id, &timestamp, &key, &value]
+                    ).await?;
+                }
+            }
+        }
+        let data = serde_json::to_string(&vitals)?;
+        arc_framework::log_to_blockchain("Update Vitals", &self.chart.patient_id, &data).await?;
+        Ok(())
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
-    dotenv().ok(); // Load .env file if present
-    let cli = Cli::parse();
-    let chart = load_patient_chart(&cli.command).await?;
+async fn run_vitals_stream(
+    patient_id: String,
+    worker_count: usize,
+    buffer_size: usize,
+    agent: NoahAgent<GeminiModel>,
+) -> Result<()> {
+    let _logger = Logger::try_with_env_or_str("info")?
+        .format(colored_detailed_format)
+        .write_mode(WriteMode::Async)
+        .duplicate_to_stdout(Duplicate::Info)
+        .start()?;
 
-    // Load Gemini API key from environment variable
-    let api_key = std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY not set");
-    let gemini_model = GeminiModel::new(api_key, "gemini-1.5-pro".to_string()); // Use Gemini 1.5 Pro
+    let registry = Registry::new();
+    let metrics = IntCounterVec::new(
+        prometheus::Opts::new("vitals_processed", "Number of vital sign updates processed"),
+        &["patient_id"],
+    )?;
+    registry.register(Box::new(metrics.clone()))?;
 
-    let training_data = vec!["Default training data for Noah".to_string()];
-    let mut agent = NoahAgent::new(chart, training_data, gemini_model);
+    let (ws_stream, _) = connect_async("ws://websocket-server:8080/vitals").await?;
+    let (_, mut ws_receiver) = ws_stream.split();
 
-    match cli.command {
-        Commands::MonitorVitals { patient_id } => {
-            agent.chart.patient_id = patient_id;
-            println!("Vitals: {}", agent.monitor_vitals().await?);
+    let (tx, rx) = mpsc::channel::<HashMap<String, f32>>(buffer_size);
+    let rx = Arc::new(Mutex::new(rx));
+
+    let workers: Vec<_> = (0..worker_count)
+        .map(|_| {
+            let rx = Arc::clone(&rx);
+            let agent = agent.clone(); // Assuming clonable for simplicity
+            let metrics = metrics.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(100));
+                while let Some(vitals) = rx.lock().await.recv().await {
+                    interval.tick().await;
+                    if let Err(e) = agent.update_vitals(vitals).await {
+                        log::error!("Failed to process vitals: {}", e);
+                    }
+                    metrics.with_label_values(&[&agent.chart.patient_id]).inc();
+                }
+            })
+        })
+        .collect();
+
+    let receiver = tokio::spawn(async move {
+        while let Some(message) = ws_receiver.next().await {
+            match message {
+                Ok(msg) if msg.is_text() => {
+                    if let Ok(vitals) = serde_json::from_str(msg.to_text()?) {
+                        let _ = tx.send(vitals).await;
+                    }
+                }
+                Ok(_) => log::warn!("Non-text message received"),
+                Err(e) => log::error!("WebSocket error: {}", e),
+            }
         }
-        Commands::ReviewMeds { patient_id } => {
-            agent.chart.patient_id = patient_id;
-            println!("Meds: {}", agent.review_meds().await?);
+    });
+
+    let metrics_server = tokio::spawn(async move {
+        async fn metrics_handler(_req: Request<Body>) -> Result<Response<Body>, Infallible> {
+            let encoder = TextEncoder::new();
+            let metric_families = prometheus::gather();
+            let mut buffer = Vec::new();
+            encoder.encode(&metric_families, &mut buffer)?;
+            Ok(Response::new(Body::from(buffer)))
         }
-        Commands::ChartAssessment { patient_id, assessment } => {
-            agent.chart.patient_id = patient_id;
-            println!("Assessment: {}", agent.chart_assessment(&assessment).await?);
+
+        let make_svc = make_service_fn(|_conn| async { Ok::<_, Infallible>(service_fn(metrics_handler)) });
+        let server = Server::bind(&([0, 0, 0, 0], 9090).into()).serve(make_svc);
+        if let Err(e) = server.await {
+            log::error!("Metrics server error: {}", e);
         }
-        Commands::ChartVitals { patient_id } => {
-            agent.chart.patient_id = patient_id;
-            println!("Vitals Charted: {}", agent.chart_vitals().await?);
-        }
-        Commands::ChartIO { patient_id, intake, output } => {
-            agent.chart.patient_id = patient_id;
-            println!("I&O: {}", agent.chart_io(intake, output).await?);
-        }
-        Commands::MonitorLabs { patient_id } => {
-            agent.chart.patient_id = patient_id;
-            println!("Labs: {}", agent.monitor_labs().await?);
-        }
-        Commands::AddTask { patient_id, task, severity, due_hours } => {
-            agent.chart.patient_id = patient_id;
-            println!("Task: {}", agent.add_task(task, severity, due_hours).await?);
-        }
-        Commands::LogNote { patient_id, note } => {
-            agent.chart.patient_id = patient_id;
-            println!("Note: {}", agent.log_provider_note(note).await?);
-        }
+    });
+
+    receiver.await??;
+    metrics_server.await??;
+    for worker in workers {
+        worker.await??;
     }
     Ok(())
 }
 
-async fn load_patient_chart(command: &Commands) -> Result<PatientChart, Error> {
-    let patient_id = match command {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<(), Error> {
+    dotenv::dotenv().ok();
+    let cli = Cli::parse();
+
+    let patient_id = match &cli.command {
         Commands::MonitorVitals { patient_id } => patient_id.clone(),
-        Commands::ReviewMeds { patient_id } => patient_id.clone(),
-        Commands::ChartAssessment { patient_id, .. } => patient_id.clone(),
-        Commands::ChartVitals { patient_id } => patient_id.clone(),
-        Commands::ChartIO { patient_id, .. } => patient_id.clone(),
-        Commands::MonitorLabs { patient_id } => patient_id.clone(),
-        Commands::AddTask { patient_id, .. } => patient_id.clone(),
-        Commands::LogNote { patient_id, .. } => patient_id.clone(),
+        Commands::MonitorVitalsStream { patient_id, .. } => patient_id.clone(),
     };
-    Ok(PatientChart {
-        patient_id,
-        vitals: HashMap::new(),
-        labs: HashMap::new(),
-        meds: vec![Medication {
-            name: "Aspirin".to_string(),
-            dose: 81.0,
-            route: "Oral".to_string(),
-            time_due: SystemTime::now() + Duration::from_secs(3600),
-            parameters: "Hold if HR < 60".to_string(),
-        }],
-        tasks: Vec::new(),
-        notes: Vec::new(),
-    })
+    let chart = Arc::new(PatientChart::new(patient_id));
+    let gemini_model = GeminiModel; // Placeholder
+    let training_data = vec!["Default training data for Noah".to_string()];
+    let db_url = match cli.db_type.as_str() {
+        "sqlite" => "/app/noah.db",
+        "mongodb" => &std::env::var("MONGO_URL").unwrap_or("mongodb://mongodb:27017/noah".to_string()),
+        "postgres" => &std::env::var("POSTGRES_URL").unwrap_or("postgres://noah_user:noah_pass@postgres:5432/noah_db".to_string()),
+        _ => return Err(anyhow::anyhow!("Unsupported DB_TYPE: {}", cli.db_type)),
+    };
+    let agent = NoahAgent::new_with_db(chart, training_data, gemini_model, &cli.db_type, db_url).await?;
+
+    match cli.command {
+        Commands::MonitorVitals { patient_id } => {
+            println!("Monitoring vitals for patient: {}", patient_id);
+        }
+        Commands::MonitorVitalsStream { patient_id, worker_count, buffer_size } => {
+            run_vitals_stream(patient_id, worker_count.unwrap_or(4), buffer_size.unwrap_or(100), agent).await?;
+        }
+    }
+    Ok(())
 }
