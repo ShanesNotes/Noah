@@ -1,0 +1,3 @@
+RUST_LOG=info
+GEMINI_API_KEY=your-key-here
+DB_TYPE=sqlite
