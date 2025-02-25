@@ -39,7 +39,7 @@ chrono = { version = "0.4", features = ["serde"] }
 dashmap = "5.4"
 tokio-retry = "0.3"
 redis = { version = "0.23", features = ["tokio-comp"], optional = true }
-bb8-redis = { version = "0.20", optional = true }  # Corrected typo from "bb8-red"
+bb8-redis = { version = "0.20", optional = true }
 actix-web = { version = "4", features = ["rustls-0_23"], optional = true }
 actix-cors = { version = "0.6", optional = true }
 tracing = "0.1"
@@ -54,6 +54,10 @@ iced = { version = "0.12", optional = true }
 pprof = "0.13"
 async-trait = "0.1"
 clickhouse-rs = { version = "1.0", optional = true }
+lazy_static = "1.4.0"
+hyper = { version = "0.14", features = ["full"] }
+futures = "0.3"
+rand = "0.8"
 
 [dev-dependencies]
 flamegraph = "0.6"

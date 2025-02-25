@@ -3,17 +3,16 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::connect_async;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, FutureExt};
 use sqlx::{SqlitePool, Pool, Sqlite, Transaction};
 use clap::{Parser, Subcommand};
-use anyhow::{Result, Error};
+use anyhow::{Result, Error, Context};
 use actix_web::{web, App as ActixApp, HttpServer, Responder, http};
 use actix_web::middleware::Logger;
-use tracing::{info, error, warn, debug};
+use tracing::{info, error, warn, debug, instrument};
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{BuildError, PrometheusBuilder, PrometheusHandle};
 use once_cell::sync::OnceCell;
-use ctor::ctor;
 use uuid::Uuid;
 use tokio::time::interval;
 use dashmap::DashMap;
@@ -24,6 +23,16 @@ use pprof::protos::Message;
 use pprof::ProfilerGuard;
 use serde_json::Value;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Serialize, Deserialize};
+use tokio_retry::Retry;
+use tokio_retry::strategy::ExponentialBackoff;
+use hyper::{Body, Request, Response, Server};
+use hyper::service::{make_service_fn, service_fn};
+use std::convert::Infallible;
+use futures::future::join_all;
+use rand::Rng;
+
 #[cfg(feature = "clickhouse")]
 use clickhouse_rs::{Pool as ClickHousePool, Block, ClientHandle};
 
@@ -35,6 +44,11 @@ mod tools;
 const BATCH_SIZE: usize = 100;
 const BATCH_TIMEOUT: Duration = Duration::from_secs(2);
 const REDIS_TTL: u64 = 300; // 5 minutes
+const DEFAULT_WORKER_COUNT: usize = 4;
+const DEFAULT_BUFFER_SIZE: usize = 100;
+
+// Global Prometheus handle
+static PROMETHEUS_HANDLE: OnceCell<PrometheusHandle> = OnceCell::new();
 
 // Data Models
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -61,6 +75,7 @@ struct PatientTask {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct OrderSet {
     order_id: String,
+    #[serde(rename = "type")]
     type_: String,
     details: String,
     parameters: HashMap<String, f32>,
@@ -75,6 +90,7 @@ struct UserPreferences {
 }
 
 // Enums
+#[derive(Clone, Debug)]
 enum AgentMode {
     Nurse,
     Patient,
@@ -88,20 +104,27 @@ enum DatabaseBackend {
 
 // CLI
 #[derive(Parser)]
+#[clap(version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+    
     #[arg(long, default_value = "sqlite")]
     db_type: String,
+    
     #[arg(long, default_value = "nurse")]
     mode: String,
+    
     #[arg(long)]
     voice: bool,
+    
     #[arg(long, default_value = "false")]
     profile: bool,
-    #[arg(long, default_value = "4")]
+    
+    #[arg(long, default_value_t = DEFAULT_WORKER_COUNT)]
     worker_count: usize,
-    #[arg(long, default_value = "100")]
+    
+    #[arg(long, default_value_t = DEFAULT_BUFFER_SIZE)]
     buffer_size: usize,
 }
 
@@ -124,6 +147,25 @@ enum Commands {
     TrendMeds { patient_id: String, medication: String, hours: Option<i64> },
     #[cfg(feature = "clickhouse")]
     TrendIO { patient_id: String, key: String, hours: Option<i64> },
+}
+
+// Trait for AI models
+#[async_trait]
+trait CompletionModel: Send + Sync + Clone {
+    async fn generate(&self, prompt: &str) -> Result<String>;
+}
+
+// Gemini model implementation
+#[derive(Clone)]
+struct GeminiModel;
+
+#[async_trait]
+impl CompletionModel for GeminiModel {
+    async fn generate(&self, prompt: &str) -> Result<String> {
+        // In a real implementation, you would call the Gemini API
+        // For now, we'll return a simulated response
+        Ok(format!("Simulated Gemini response for: {}", prompt))
+    }
 }
 
 // Core structs
@@ -159,123 +201,188 @@ impl BlockchainExecutor {
     }
 }
 
+// Noah Agent
 #[derive(Clone)]
-struct NoahAgent<M: CompletionModel> {
+struct NoahAgent {
     chart: Arc<PatientChart>,
-    rig_agent: Agent<M>,
-    db: DatabaseBackend,
-    preferences: UserPreferences,
-    mode: AgentMode,
-    tools: HashMap<String, Arc<dyn Tool>>,
+    training_data: Vec<String>,
+    model: GeminiModel,
+    db: Arc<DatabaseBackend>,
+    redis_pool: RedisPool<RedisConnectionManager>,
     task_queue: Arc<Mutex<VecDeque<PatientTask>>>,
-    hospital_network: HospitalNetwork,
     ordersets: Arc<Mutex<Vec<OrderSet>>>,
     alerts: Arc<Mutex<Vec<String>>>,
-    cache: DashMap<String, Value>,
-    redis_pool: RedisPool<RedisConnectionManager>,
-    blockchain_executor: Arc<BlockchainExecutor>,
+    cache: Arc<DashMap<String, Value>>,
+    mode: AgentMode,
+    preferences: UserPreferences,
+    tools: Arc<HashMap<String, Box<dyn tools::Tool>>>,
 }
 
-impl<M: CompletionModel + Send + Sync> NoahAgent<M> {
+impl NoahAgent {
     async fn new(
         chart: Arc<PatientChart>,
         training_data: Vec<String>,
-        model: M,
+        model: GeminiModel,
         db_type: &str,
         db_url: &str,
         mode: AgentMode,
         voice_enabled: bool,
     ) -> Result<Self> {
-        let rig_agent = AgentBuilder::new(model)
-            .preamble("Noah: Critical Care AI Assistant")
-            .context(&training_data.join("\n"))
-            .build();
-
+        // Initialize database
         let db = match db_type {
-            "sqlite" => Self::init_sqlite(db_url).await?,
+            "sqlite" => {
+                let pool = SqlitePool::connect(db_url).await?;
+                
+                // Create tables if they don't exist
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS vitals (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        patient_id TEXT NOT NULL,
+                        timestamp INTEGER NOT NULL,
+                        key TEXT NOT NULL,
+                        value REAL NOT NULL,
+                        event_id TEXT NOT NULL
+                    )"
+                )
+                .execute(&pool)
+                .await?;
+                
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS labs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        patient_id TEXT NOT NULL,
+                        timestamp INTEGER NOT NULL,
+                        key TEXT NOT NULL,
+                        value REAL NOT NULL,
+                        event_id TEXT NOT NULL
+                    )"
+                )
+                .execute(&pool)
+                .await?;
+                
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS medications (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        patient_id TEXT NOT NULL,
+                        timestamp INTEGER NOT NULL,
+                        order_id TEXT NOT NULL,
+                        medication TEXT NOT NULL,
+                        event_id TEXT NOT NULL
+                    )"
+                )
+                .execute(&pool)
+                .await?;
+                
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS io (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        patient_id TEXT NOT NULL,
+                        timestamp INTEGER NOT NULL,
+                        key TEXT NOT NULL,
+                        value REAL NOT NULL,
+                        event_id TEXT NOT NULL
+                    )"
+                )
+                .execute(&pool)
+                .await?;
+                
+                Arc::new(DatabaseBackend::SQLite(pool))
+            }
             #[cfg(feature = "clickhouse")]
-            "clickhouse" => Self::init_clickhouse(db_url).await?,
-            _ => return Err(anyhow::anyhow!("Unsupported DB_TYPE: {}", db_type)),
+            "clickhouse" => {
+                let pool = ClickHousePool::new(db_url);
+                let mut client = pool.get_handle().await?;
+                
+                // Create tables if they don't exist
+                client.execute(
+                    "CREATE TABLE IF NOT EXISTS vitals (
+                        patient_id String,
+                        timestamp Int64,
+                        key String,
+                        value Float64,
+                        event_id String
+                    ) ENGINE = MergeTree()
+                    ORDER BY (patient_id, timestamp)"
+                ).await?;
+                
+                client.execute(
+                    "CREATE TABLE IF NOT EXISTS labs (
+                        patient_id String,
+                        timestamp Int64,
+                        key String,
+                        value Float64,
+                        event_id String
+                    ) ENGINE = MergeTree()
+                    ORDER BY (patient_id, timestamp)"
+                ).await?;
+                
+                client.execute(
+                    "CREATE TABLE IF NOT EXISTS medications (
+                        patient_id String,
+                        timestamp Int64,
+                        key String,
+                        order_id String,
+                        medication String,
+                        event_id String
+                    ) ENGINE = MergeTree()
+                    ORDER BY (patient_id, timestamp)"
+                ).await?;
+                
+                client.execute(
+                    "CREATE TABLE IF NOT EXISTS io_outputs (
+                        patient_id String,
+                        timestamp Int64,
+                        key String,
+                        value Float64,
+                        event_id String
+                    ) ENGINE = MergeTree()
+                    ORDER BY (patient_id, timestamp)"
+                ).await?;
+                
+                client.execute(
+                    "CREATE TABLE IF NOT EXISTS io_inputs (
+                        patient_id String,
+                        timestamp Int64,
+                        key String,
+                        value String,
+                        event_id String
+                    ) ENGINE = MergeTree()
+                    ORDER BY (patient_id, timestamp)"
+                ).await?;
+                
+                Arc::new(DatabaseBackend::ClickHouse(pool))
+            }
+            _ => return Err(anyhow::anyhow!("Unsupported database type: {}", db_type)),
         };
-
-        let redis_manager = RedisConnectionManager::new("redis://redis:6379")?;
-        let redis_pool = RedisPool::builder()
-            .max_size(20)
-            .build(redis_manager)
-            .await?;
+        
+        // Initialize Redis
+        let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let manager = RedisConnectionManager::new(redis_url)?;
+        let redis_pool = RedisPool::builder().build(manager).await?;
+        
+        // Initialize tools
+        let mut tools_map: HashMap<String, Box<dyn tools::Tool>> = HashMap::new();
+        tools_map.insert("VitalsChecker".to_string(), Box::new(tools::VitalsChecker));
+        tools_map.insert("ChartAssessment".to_string(), Box::new(tools::ChartAssessment));
+        tools_map.insert("RecordIO".to_string(), Box::new(tools::RecordIO));
+        tools_map.insert("CheckLabValues".to_string(), Box::new(tools::CheckLabValues));
+        tools_map.insert("AdministerMedication".to_string(), Box::new(tools::AdministerMedication));
+        tools_map.insert("AnalyzeTestResults".to_string(), Box::new(tools::AnalyzeTestResults));
 
         Ok(Self {
             chart,
-            rig_agent,
+            training_data,
+            model,
             db,
-            preferences: UserPreferences { language: "English".to_string(), voice_enabled },
-            mode,
-            tools: Self::init_tools(),
+            redis_pool,
             task_queue: Arc::new(Mutex::new(VecDeque::new())),
-            hospital_network: HospitalNetwork::new(),
             ordersets: Arc::new(Mutex::new(Vec::new())),
             alerts: Arc::new(Mutex::new(Vec::new())),
-            cache: DashMap::new(),
-            redis_pool,
-            blockchain_executor: Arc::new(BlockchainExecutor {
-                client: Arc::new(Mutex::new(ArcClient)),
-            }),
+            cache: Arc::new(DashMap::new()),
+            mode,
+            preferences: UserPreferences { language: "English".to_string(), voice_enabled },
+            tools: Arc::new(tools_map),
         })
-    }
-
-    async fn init_sqlite(db_url: &str) -> Result<DatabaseBackend> {
-        let pool = SqlitePool::connect(db_url).await?;
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS patients (id TEXT PRIMARY KEY, name TEXT, age INTEGER, sex TEXT, diagnosis TEXT, room TEXT, ventilated INTEGER); \
-             CREATE TABLE IF NOT EXISTS ordersets (patient_id TEXT, order_id TEXT PRIMARY KEY, type TEXT, details TEXT, parameters TEXT, interventions TEXT, timestamp TEXT); \
-             CREATE TABLE IF NOT EXISTS labs (patient_id TEXT, timestamp BIGINT, key TEXT, value REAL, event_id TEXT); \
-             CREATE TABLE IF NOT EXISTS medications (patient_id TEXT, order_id TEXT, medication TEXT, administered_at TEXT, event_id TEXT); \
-             CREATE TABLE IF NOT EXISTS vitals (patient_id TEXT, timestamp BIGINT, key TEXT, value REAL, event_id TEXT); \
-             CREATE TABLE IF NOT EXISTS io (patient_id TEXT, timestamp BIGINT, key TEXT, value REAL, event_id TEXT);"
-        ).execute(&pool).await?;
-        Ok(DatabaseBackend::SQLite(pool))
-    }
-
-    #[cfg(feature = "clickhouse")]
-    async fn init_clickhouse(db_url: &str) -> Result<DatabaseBackend> {
-        let pool = ClickHousePool::new(db_url);
-        let mut client = pool.get_handle().await?;
-        let tables = [
-            ("vitals", "value Float32 CODEC(ZSTD), INDEX value_idx value TYPE minmax GRANULARITY 8192"),
-            ("labs", "value Float32 CODEC(ZSTD), INDEX value_idx value TYPE minmax GRANULARITY 8192"),
-            ("io_outputs", "value Float32 CODEC(ZSTD), INDEX value_idx value TYPE minmax GRANULARITY 8192"),
-            ("io_inputs", "value String CODEC(ZSTD)"),
-            ("medications", "order_id String, medication String CODEC(ZSTD)"),
-        ];
-
-        for (table, extra_columns) in tables.iter() {
-            let query = format!(
-                "CREATE TABLE IF NOT EXISTS {} (
-                    patient_id String,
-                    timestamp Int64,
-                    key String CODEC(ZSTD),
-                    {},
-                    event_id String
-                ) ENGINE = MergeTree()
-                PARTITION BY toDate(timestamp / 1000)
-                ORDER BY (patient_id, timestamp)
-                SETTINGS index_granularity = 8192",
-                table, extra_columns
-            );
-            client.execute(&query).await?;
-        }
-        Ok(DatabaseBackend::ClickHouse(pool))
-    }
-
-    fn init_tools() -> HashMap<String, Arc<dyn Tool>> {
-        HashMap::from([
-            ("vitals_checker".to_string(), Arc::new(VitalsChecker) as Arc<dyn Tool>),
-            ("chart_assessment".to_string(), Arc::new(ChartAssessment) as Arc<dyn Tool>),
-            ("record_io".to_string(), Arc::new(RecordIO) as Arc<dyn Tool>),
-            ("check_lab_values".to_string(), Arc::new(CheckLabValues) as Arc<dyn Tool>),
-            ("administer_medication".to_string(), Arc::new(AdministerMedication) as Arc<dyn Tool>),
-            ("analyze_test_results".to_string(), Arc::new(AnalyzeTestResults) as Arc<dyn Tool>),
-        ])
     }
 
     async fn store_in_redis(&self, key: String, value: &impl Serialize) -> Result<()> {
@@ -604,7 +711,7 @@ impl<M: CompletionModel + Send + Sync> NoahAgent<M> {
     }
 
     async fn monitor_vitals(&self) -> Result<String> {
-        let checker = self.tools.get("vitals_checker").ok_or_else(|| anyhow::anyhow!("Vitals checker tool not found"))?;
+        let checker = self.tools.get("VitalsChecker").ok_or_else(|| anyhow::anyhow!("Vitals checker tool not found"))?;
         let vitals = checker.execute(&self.chart.patient_id).await?;
         let response = match self.mode {
             AgentMode::Nurse => format!("Vitals for nurse review: {}", vitals),
@@ -638,12 +745,12 @@ impl<M: CompletionModel + Send + Sync> NoahAgent<M> {
 
     async fn execute_task(&self, task_description: &str) -> Result<String> {
         match task_description {
-            "Check vitals" => self.tools.get("vitals_checker").unwrap().execute(&self.chart.patient_id).await,
-            "Chart assessment" => self.tools.get("chart_assessment").unwrap().execute(&self.chart.patient_id).await,
-            "Record I/O" => self.tools.get("record_io").unwrap().execute(&self.chart.patient_id).await,
-            "Check lab values" => self.tools.get("check_lab_values").unwrap().execute(&self.chart.patient_id).await,
-            "Administer medication" => self.tools.get("administer_medication").unwrap().execute(&self.chart.patient_id).await,
-            "Analyze test results" => self.tools.get("analyze_test_results").unwrap().execute(&self.chart.patient_id).await,
+            "Check vitals" => self.tools.get("VitalsChecker").unwrap().execute(&self.chart.patient_id).await,
+            "Chart assessment" => self.tools.get("ChartAssessment").unwrap().execute(&self.chart.patient_id).await,
+            "Record I/O" => self.tools.get("RecordIO").unwrap().execute(&self.chart.patient_id).await,
+            "Check lab values" => self.tools.get("CheckLabValues").unwrap().execute(&self.chart.patient_id).await,
+            "Administer medication" => self.tools.get("AdministerMedication").unwrap().execute(&self.chart.patient_id).await,
+            "Analyze test results" => self.tools.get("AnalyzeTestResults").unwrap().execute(&self.chart.patient_id).await,
             "Titrate Levophed by 0.02 mcg/kg/min" => {
                 self.blockchain_executor.execute_intervention(&self.chart.patient_id, task_description).await?;
                 Ok("Titrating Levophed on blockchain".to_string())
@@ -742,7 +849,7 @@ impl<M: CompletionModel + Send + Sync> NoahAgent<M> {
 }
 
 struct FloodApp {
-    agent: NoahAgent<GeminiModel>,
+    agent: NoahAgent,
     selected_tab: String,
     patient_data: DashMap<String, String>,
 }
@@ -757,7 +864,7 @@ impl Application for FloodApp {
     type Executor = executor::Default;
     type Message = Message;
     type Theme = Theme;
-    type Flags = NoahAgent<GeminiModel>;
+    type Flags = NoahAgent;
 
     fn new(agent: Self::Flags) -> (Self, Command<Self::Message>) {
         (Self {
@@ -812,8 +919,6 @@ impl Application for FloodApp {
     }
 }
 
-static PROMETHEUS_HANDLE: OnceCell<PrometheusHandle> = OnceCell::new();
-
 #[derive(Debug, thiserror::Error)]
 pub enum MetricsError {
     #[error("Failed to install metrics recorder")]
@@ -848,7 +953,7 @@ async fn run_vitals_pipeline(
     patient_id: String,
     worker_count: usize,
     buffer_size: usize,
-    agent: NoahAgent<GeminiModel>,
+    agent: NoahAgent,
 ) -> Result<()> {
     gauge!("active_pipelines").increment(1.0);
     let patient_tasks = agent.task_queue.lock().await.len() as f64;
@@ -951,23 +1056,41 @@ async fn run_vitals_pipeline(
                     if let Some(patients) = data["patients"].as_array() {
                         for patient in patients {
                             if patient["patientId"].as_str() == Some(&patient_id) {
-                                let vitals: HashMap<String, f32> = serde_json::from_value(patient["vitals"].clone()).unwrap_or_default();
-                                let ordersets: Vec<OrderSet> = serde_json::from_value(patient["ordersets"].clone()).unwrap_or_default();
-                                let mar: Vec<Value> = patient["mar"]["records"].as_array().map_or(Vec::new(), |arr| arr.to_vec());
-                                let labs: HashMap<String, f32> = serde_json::from_value(patient["labs"].clone()).unwrap_or_default();
-                                let io_inputs: HashMap<String, Value> = serde_json::from_value(patient["io"]["inputs"].clone()).unwrap_or_default();
-                                let io_outputs: HashMap<String, f32> = serde_json::from_value(patient["io"]["outputs"].clone()).unwrap_or_default();
-                                let chest_xray = patient["chestXRay"].as_str().map(String::from);
-                                if let Err(e) = tx.send((vitals, ordersets, mar, labs, io_inputs, io_outputs, chest_xray)).await {
-                                    error!("Channel send failed: {}, skipping...", e);
+                                let mut vitals_map = HashMap::new();
+                                if let Some(vitals_obj) = patient["vitals"].as_object() {
+                                    for (key, value) in vitals_obj {
+                                        if let Some(num) = value.as_f64() {
+                                            vitals_map.insert(key.clone(), num as f32);
+                                        }
+                                    }
+                                }
+                                
+                                // Get current ordersets
+                                let ordersets = agent.ordersets.lock().await.clone();
+                                
+                                // Send to worker pool
+                                if let Err(e) = tx.send((vitals_map, ordersets)).await {
+                                    error!("Failed to send vitals to worker: {}", e);
                                 }
                             }
                         }
                     }
                 }
-                Err(e) => warn!("WebSocket error: {}, retrying...", e),
+                Err(e) => {
+                    error!("WebSocket error: {}", e);
+                    break;
+                }
             }
         }
+        
+        // Signal workers to shut down
+        drop(tx);
+        
+        // Wait for all workers to complete
+        for handle in worker_handles {
+            handle.await?;
+        }
+        
         Ok::<(), Error>(())
     });
 
@@ -993,184 +1116,413 @@ async fn run_vitals_pipeline(
     Ok(())
 }
 
-async fn run_flood_api(agent: NoahAgent<GeminiModel>) -> Result<(), Error> {
+async fn run_flood_api(agent: NoahAgent) -> Result<()> {
+    // Initialize Prometheus metrics
+    let builder = PrometheusBuilder::new();
+    let handle = builder
+        .install_recorder()
+        .context("Failed to install Prometheus recorder")?;
+    
+    PROMETHEUS_HANDLE.set(handle).unwrap();
+    
+    // Initialize HTTP server
+    let agent_data = web::Data::new(agent);
+    
     HttpServer::new(move || {
         ActixApp::new()
+            .app_data(agent_data.clone())
             .wrap(Logger::default())
-            .wrap(actix_cors::Cors::permissive()
-                .allowed_methods(vec!["GET", "POST"])
-                .allowed_headers(vec![header::CONTENT_TYPE, header::ACCEPT])
-                .max_age(3600))
-            .route("/vitals/{patient_id}", web::get().to(get_vitals))
-            .route("/labs/{patient_id}", web::get().to(get_labs))
-            .route("/meds/{patient_id}", web::get().to(get_meds))
-            .route("/orders/{patient_id}", web::get().to(get_orders))
-            .route("/io/{patient_id}", web::get().to(get_io))
-            .route("/metrics", web::get().to(metrics_handler))
-            .app_data(web::Data::new(agent.clone()))
+            .service(
+                web::scope("/api")
+                    .route("/vitals", web::get().to(get_vitals))
+                    .route("/vitals", web::post().to(post_vitals))
+                    .route("/labs", web::get().to(get_labs))
+                    .route("/labs", web::post().to(post_labs))
+                    .route("/medications", web::get().to(get_medications))
+                    .route("/medications", web::post().to(post_medications))
+                    .route("/tasks", web::get().to(get_tasks))
+                    .route("/tasks", web::post().to(post_tasks))
+                    .route("/alerts", web::get().to(get_alerts))
+                    .route("/chart", web::get().to(get_chart))
+                    .route("/ordersets", web::get().to(get_ordersets))
+                    .route("/ordersets", web::post().to(post_ordersets))
+            )
+            .service(web::resource("/metrics").to(metrics_handler))
+            .service(web::resource("/health").to(health_handler))
     })
-    .bind(("0.0.0.0", 8081))?
-    .workers(4)
+    .bind("0.0.0.0:8081")?
     .run()
     .await?;
+    
     Ok(())
 }
 
-async fn get_vitals(path: web::Path<String>, agent: web::Data<NoahAgent<GeminiModel>>) -> impl Responder {
-    let patient_id = path.into_inner();
+// HTTP handlers
+async fn get_vitals(agent: web::Data<NoahAgent>) -> impl Responder {
     match agent.monitor_vitals().await {
-        Ok(vitals) => web::Json(serde_json::json!({ "patient_id": patient_id, "vitals": vitals })),
-        Err(e) => web::Json(serde_json::json!({ "error": e.to_string() })).status(http::StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(vitals) => web::Json(serde_json::json!({ "vitals": vitals })),
+        Err(e) => {
+            error!("Failed to get vitals: {}", e);
+            web::Json(serde_json::json!({ "error": e.to_string() }))
+        }
     }
 }
 
-async fn get_labs(path: web::Path<String>, agent: web::Data<NoahAgent<GeminiModel>>) -> impl Responder {
-    let patient_id = path.into_inner();
-    match agent.update_labs(HashMap::from([("K".to_string(), 3.5), ("LacticAcid".to_string(), 2.5)])).await {
-        Ok(labs) => web::Json(serde_json::json!({ "patient_id": patient_id, "labs": labs })),
-        Err(e) => web::Json(serde_json::json!({ "error": e.to_string() })).status(http::StatusCode::INTERNAL_SERVER_ERROR),
-    }
-}
-
-async fn get_meds(path: web::Path<String>, agent: web::Data<NoahAgent<GeminiModel>>) -> impl Responder {
-    let patient_id = path.into_inner();
-    match agent.update_medications(vec![serde_json::json!({
-        "orderId": "ORD001",
-        "medication": "Levophed 0.1 mcg/kg/min",
-        "administeredAt": SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
-    }])).await {
-        Ok(_) => web::Json(serde_json::json!({ "patient_id": patient_id, "meds": "Medication records" })),
-        Err(e) => web::Json(serde_json::json!({ "error": e.to_string() })).status(http::StatusCode::INTERNAL_SERVER_ERROR),
-    }
-}
-
-async fn get_orders(path: web::Path<String>, agent: web::Data<NoahAgent<GeminiModel>>) -> impl Responder {
-    let patient_id = path.into_inner();
+async fn post_vitals(agent: web::Data<NoahAgent>, vitals: web::Json<HashMap<String, f32>>) -> impl Responder {
     let ordersets = agent.ordersets.lock().await.clone();
-    web::Json(serde_json::json!({ "patient_id": patient_id, "orders": ordersets }))
+    match agent.update_vitals(vitals.into_inner(), ordersets).await {
+        Ok(_) => web::Json(serde_json::json!({ "status": "success" })),
+        Err(e) => {
+            error!("Failed to update vitals: {}", e);
+            web::Json(serde_json::json!({ "error": e.to_string() }))
+        }
+    }
 }
 
-async fn get_io(path: web::Path<String>, agent: web::Data<NoahAgent<GeminiModel>>) -> impl Responder {
-    let patient_id = path.into_inner();
-    match agent.update_io(
-        HashMap::from([("ivPump".to_string(), Value::from("NS 100 mL/hr"))]),
-        HashMap::from([("foley".to_string(), 50.0)])
-    ).await {
-        Ok(_) => web::Json(serde_json::json!({ "patient_id": patient_id, "io": "I/O records" })),
-        Err(e) => web::Json(serde_json::json!({ "error": e.to_string() })).status(http::StatusCode::INTERNAL_SERVER_ERROR),
+async fn get_labs(agent: web::Data<NoahAgent>) -> impl Responder {
+    // In a real implementation, you would fetch labs from the database
+    web::Json(serde_json::json!({ "labs": { "K": 3.5, "LacticAcid": 2.5 } }))
+}
+
+async fn post_labs(agent: web::Data<NoahAgent>, labs: web::Json<HashMap<String, f32>>) -> impl Responder {
+    match agent.update_labs(labs.into_inner()).await {
+        Ok(result) => web::Json(serde_json::json!({ "status": "success", "result": result })),
+        Err(e) => {
+            error!("Failed to update labs: {}", e);
+            web::Json(serde_json::json!({ "error": e.to_string() }))
+        }
+    }
+}
+
+async fn get_medications(agent: web::Data<NoahAgent>) -> impl Responder {
+    // In a real implementation, you would fetch medications from the database
+    web::Json(serde_json::json!({
+        "medications": [
+            { "orderId": "ORD001", "medication": "Levophed 0.1 mcg/kg/min" }
+        ]
+    }))
+}
+
+async fn post_medications(agent: web::Data<NoahAgent>, medications: web::Json<Vec<Value>>) -> impl Responder {
+    match agent.update_medications(medications.into_inner()).await {
+        Ok(_) => web::Json(serde_json::json!({ "status": "success" })),
+        Err(e) => {
+            error!("Failed to update medications: {}", e);
+            web::Json(serde_json::json!({ "error": e.to_string() }))
+        }
+    }
+}
+
+async fn get_tasks(agent: web::Data<NoahAgent>) -> impl Responder {
+    let tasks = agent.task_queue.lock().await.clone();
+    web::Json(serde_json::json!({ "tasks": tasks }))
+}
+
+async fn post_tasks(agent: web::Data<NoahAgent>, task: web::Json<serde_json::Value>) -> impl Responder {
+    if let Some(description) = task.get("description").and_then(|d| d.as_str()) {
+        let severity = task.get("severity").and_then(|s| s.as_u64()).unwrap_or(5) as u8;
+        match agent.add_task(description, severity).await {
+            Ok(_) => web::Json(serde_json::json!({ "status": "success" })),
+            Err(e) => {
+                error!("Failed to add task: {}", e);
+                web::Json(serde_json::json!({ "error": e.to_string() }))
+            }
+        }
+    } else {
+        web::Json(serde_json::json!({ "error": "Missing task description" }))
+    }
+}
+
+async fn get_alerts(agent: web::Data<NoahAgent>) -> impl Responder {
+    let alerts = agent.alerts.lock().await.clone();
+    web::Json(serde_json::json!({ "alerts": alerts }))
+}
+
+async fn get_chart(agent: web::Data<NoahAgent>) -> impl Responder {
+    web::Json(serde_json::json!({ "chart": agent.chart }))
+}
+
+async fn get_ordersets(agent: web::Data<NoahAgent>) -> impl Responder {
+    let ordersets = agent.ordersets.lock().await.clone();
+    web::Json(serde_json::json!({ "ordersets": ordersets }))
+}
+
+async fn post_ordersets(agent: web::Data<NoahAgent>, ordersets: web::Json<Vec<OrderSet>>) -> impl Responder {
+    match agent.update_ordersets(ordersets.into_inner()).await {
+        Ok(_) => web::Json(serde_json::json!({ "status": "success" })),
+        Err(e) => {
+            error!("Failed to update ordersets: {}", e);
+            web::Json(serde_json::json!({ "error": e.to_string() }))
+        }
     }
 }
 
 async fn metrics_handler() -> impl Responder {
-    let handle = PROMETHEUS_HANDLE.get().expect("Prometheus handle not initialized");
-    web::HttpResponse::Ok().content_type("text/plain").body(handle.render())
-}
-
-fn profile<F, R>(f: F) -> R where F: FnOnce() -> R {
-    let guard = ProfilerGuard::new(100).unwrap();
-    let result = f();
-    if let Ok(report) = guard.report().build() {
-        let mut file = std::fs::File::create("flamegraph.svg").unwrap();
-        report.flamegraph(&mut file).unwrap();
+    match PROMETHEUS_HANDLE.get() {
+        Some(handle) => {
+            let metrics = handle.render();
+            web::HttpResponse::Ok()
+                .content_type("text/plain")
+                .body(metrics)
+        }
+        None => web::HttpResponse::InternalServerError().body("Metrics not initialized"),
     }
-    result
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
-async fn main() -> Result<(), Error> {
+async fn health_handler() -> impl Responder {
+    web::HttpResponse::Ok().json(serde_json::json!({
+        "status": "healthy",
+        "version": env!("CARGO_PKG_VERSION"),
+        "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    }))
+}
+
+// Profiling helper
+fn profile<F>(f: F)
+where
+    F: FnOnce(),
+{
+    // Create a guard for CPU profiling
+    let guard = ProfilerGuard::new(100).unwrap();
+    
+    // Run the function
+    f();
+    
+    // Write CPU profile to file
+    if let Ok(report) = guard.report().build() {
+        let file = std::fs::File::create("noah-flamegraph.pb").unwrap();
+        let mut buf = std::io::BufWriter::new(file);
+        report.write_to_writer(&mut buf).unwrap();
+        
+        // Also create a flamegraph
+        let file = std::fs::File::create("noah-flamegraph.svg").unwrap();
+        report.flamegraph(file).unwrap();
+    }
+}
+
+// External APIs module (simulated)
+mod external_apis {
+    use anyhow::Result;
+    
+    pub async fn text_to_speech(text: &str, language: &str) -> Result<()> {
+        // In a real implementation, you would call a TTS API
+        // For now, we'll just log the text
+        tracing::info!("TTS ({}) would say: {}", language, text);
+        Ok(())
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize tracing
+    tracing_subscriber::fmt::init();
+    
+    // Load environment variables
     dotenv::dotenv().ok();
-
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
-        .init();
-
+    
+    // Parse command line arguments
     let cli = Cli::parse();
-    let patient_id = match &cli.command {
-        Commands::MonitorVitals { patient_id } => patient_id,
-        Commands::MonitorVitalsStream { patient_id, .. } => patient_id,
-        Commands::LaunchFlood => "Seymore Butts",
-        Commands::ChartVitals { patient_id, .. } => patient_id,
-        Commands::ManageOrders { patient_id } => patient_id,
-        Commands::AnalyzeLabs { patient_id } => patient_id,
-        Commands::ChartLabs { patient_id } => patient_id,
-        Commands::ManageMAR { patient_id } => patient_id,
-        Commands::MonitorBlockchain { patient_id } => patient_id,
-        #[cfg(feature = "clickhouse")] Commands::TrendVitals { patient_id, .. } => patient_id,
-        #[cfg(feature = "clickhouse")] Commands::TrendLabs { patient_id, .. } => patient_id,
-        #[cfg(feature = "clickhouse")] Commands::TrendMeds { patient_id, .. } => patient_id,
-        #[cfg(feature = "clickhouse")] Commands::TrendIO { patient_id, .. } => patient_id,
-    }.to_string();
-
-    let chart = Arc::new(PatientChart {
-        patient_id: patient_id.clone(),
-        name: patient_id,
-        age: 65,
-        sex: "M".to_string(),
-        diagnosis: "Unknown".to_string(),
-        room: "ICU-101".to_string(),
-        ventilated: false,
-    });
-
-    let agent = NoahAgent::new(
-        chart,
-        vec!["Default training data for Noah".to_string()],
-        GeminiModel,
-        &cli.db_type,
-        if cli.db_type == "sqlite" { "/app/noah.db" } else { "clickhouse://localhost:8123" },
-        match cli.mode.as_str() { "nurse" => AgentMode::Nurse, "patient" => AgentMode::Patient, _ => AgentMode::Nurse },
-        cli.voice,
-    ).await?;
-
+    
+    // Create a run command function that can be profiled
     let run_command = |command: Commands| async move {
+        // Create patient chart
+        let chart = Arc::new(PatientChart {
+            patient_id: match &command {
+                Commands::MonitorVitals { patient_id } => patient_id.clone(),
+                Commands::MonitorVitalsStream { patient_id } => patient_id.clone(),
+                Commands::ChartVitals { patient_id, .. } => patient_id.clone(),
+                Commands::ManageOrders { patient_id } => patient_id.clone(),
+                Commands::AnalyzeLabs { patient_id } => patient_id.clone(),
+                Commands::ChartLabs { patient_id } => patient_id.clone(),
+                Commands::ManageMAR { patient_id } => patient_id.clone(),
+                Commands::MonitorBlockchain { patient_id } => patient_id.clone(),
+                #[cfg(feature = "clickhouse")]
+                Commands::TrendVitals { patient_id, .. } => patient_id.clone(),
+                #[cfg(feature = "clickhouse")]
+                Commands::TrendLabs { patient_id, .. } => patient_id.clone(),
+                #[cfg(feature = "clickhouse")]
+                Commands::TrendMeds { patient_id, .. } => patient_id.clone(),
+                #[cfg(feature = "clickhouse")]
+                Commands::TrendIO { patient_id, .. } => patient_id.clone(),
+                _ => "DEFAULT_PATIENT".to_string(),
+            },
+            name: "John Doe".to_string(),
+            age: 65,
+            sex: "M".to_string(),
+            diagnosis: "Septic Shock".to_string(),
+            room: "ICU-1".to_string(),
+            ventilated: true,
+        });
+        
+        // Create agent mode
+        let mode = match cli.mode.as_str() {
+            "nurse" => AgentMode::Nurse,
+            "patient" => AgentMode::Patient,
+            _ => AgentMode::Nurse,
+        };
+        
+        // Create agent
+        let agent = NoahAgent::new(
+            chart,
+            vec!["Training data 1".to_string(), "Training data 2".to_string()],
+            GeminiModel,
+            &cli.db_type,
+            &std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite::memory:".to_string()),
+            mode,
+            cli.voice,
+        ).await?;
+        
+        // Execute command
         match command {
-            Commands::MonitorVitals { .. } => {
-                agent.add_task("Check vitals", 5).await?;
-                let task = agent.prioritize_tasks().await?;
-                info!("Executing task: {}", agent.execute_task(&task).await?);
-                info!("Vitals: {}", agent.monitor_vitals().await?);
-                info!("{}", agent.monitor_ehr().await?);
+            Commands::MonitorVitals { patient_id } => {
+                let vitals = agent.monitor_vitals().await?;
+                info!("Vitals for {}: {}", patient_id, vitals);
             }
-            Commands::MonitorVitalsStream { patient_id, .. } => {
-                agent.add_task("Check vitals", 5).await?;
-                run_vitals_pipeline(patient_id, cli.worker_count, cli.buffer_size, agent.clone()).await?;
+            Commands::MonitorVitalsStream { patient_id } => {
+                info!("Starting vitals stream for {}", patient_id);
+                run_vitals_pipeline(patient_id, cli.worker_count, cli.buffer_size, agent).await?;
             }
             Commands::LaunchFlood => {
-                tokio::try_join!(
-                    run_vitals_pipeline("Seymore Butts".to_string(), cli.worker_count, cli.buffer_size, agent.clone()),
-                    run_flood_api(agent.clone())
-                )?;
+                info!("Launching Flood API server");
+                run_flood_api(agent).await?;
             }
             Commands::ChartVitals { patient_id, interval } => {
-                agent.add_task("Chart vitals", 5).await?;
-                run_vitals_pipeline(patient_id, cli.worker_count, cli.buffer_size, agent.clone()).await?;
+                let interval_secs = interval.unwrap_or(60);
+                info!("Charting vitals for {} every {} seconds", patient_id, interval_secs);
+                
+                let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+                
+                // Create some sample vitals
+                let mut vitals = HashMap::new();
+                vitals.insert("HR".to_string(), 88.0);
+                vitals.insert("MAP".to_string(), 65.0);
+                vitals.insert("SpO2".to_string(), 94.0);
+                vitals.insert("RR".to_string(), 22.0);
+                vitals.insert("Temp".to_string(), 38.2);
+                
+                // Create some sample ordersets
+                let mut ordersets = Vec::new();
+                ordersets.push(OrderSet {
+                    order_id: "ORD001".to_string(),
+                    type_: "MAP".to_string(),
+                    details: "Maintain MAP > 65".to_string(),
+                    parameters: {
+                        let mut params = HashMap::new();
+                        params.insert("MAP".to_string(), 65.0);
+                        params
+                    },
+                    interventions: vec![
+                        "Increase Levophed by 0.05 mcg/kg/min".to_string(),
+                        "Administer 500mL fluid bolus".to_string(),
+                    ],
+                    timestamp: chrono::Utc::now(),
+                });
+                
+                // Update ordersets
+                agent.update_ordersets(ordersets.clone()).await?;
+                
+                // Chart vitals at regular intervals
+                loop {
+                    interval.tick().await;
+                    
+                    // Randomly vary vitals
+                    for value in vitals.values_mut() {
+                        *value += (rand::random::<f32>() - 0.5) * 5.0;
+                    }
+                    
+                    // Update vitals
+                    agent.update_vitals(vitals.clone(), ordersets.clone()).await?;
+                    info!("Charted vitals for {}: {:?}", patient_id, vitals);
+                }
             }
             Commands::ManageOrders { patient_id } => {
-                let ordersets = agent.ordersets.lock().await.clone();
-                info!("Managing orders for {}: {:?}", patient_id, ordersets);
-                agent.add_task("Manage orders", 5).await?;
+                info!("Managing orders for {}", patient_id);
+                
+                // Create some sample ordersets
+                let mut ordersets = Vec::new();
+                ordersets.push(OrderSet {
+                    order_id: "ORD001".to_string(),
+                    type_: "MAP".to_string(),
+                    details: "Maintain MAP > 65".to_string(),
+                    parameters: {
+                        let mut params = HashMap::new();
+                        params.insert("MAP".to_string(), 65.0);
+                        params
+                    },
+                    interventions: vec![
+                        "Increase Levophed by 0.05 mcg/kg/min".to_string(),
+                        "Administer 500mL fluid bolus".to_string(),
+                    ],
+                    timestamp: chrono::Utc::now(),
+                });
+                
+                // Update ordersets
+                agent.update_ordersets(ordersets).await?;
+                info!("Updated ordersets for {}", patient_id);
             }
             Commands::AnalyzeLabs { patient_id } => {
-                let labs = HashMap::from([("K".to_string(), 3.5), ("LacticAcid".to_string(), 2.5)]);
-                info!("Analyzing labs for {}: {:?}", patient_id, labs);
-                agent.update_labs(labs).await?;
-                agent.add_task("Analyze labs", 5).await?;
+                info!("Analyzing labs for {}", patient_id);
+                
+                // Create some sample labs
+                let mut labs = HashMap::new();
+                labs.insert("K".to_string(), 3.2);
+                labs.insert("Na".to_string(), 138.0);
+                labs.insert("Cl".to_string(), 101.0);
+                labs.insert("HCO3".to_string(), 22.0);
+                labs.insert("BUN".to_string(), 25.0);
+                labs.insert("Cr".to_string(), 1.2);
+                labs.insert("Glucose".to_string(), 142.0);
+                labs.insert("LacticAcid".to_string(), 2.8);
+                
+                // Update labs
+                let result = agent.update_labs(labs).await?;
+                info!("Lab analysis for {}: {}", patient_id, result);
             }
             Commands::ChartLabs { patient_id } => {
-                let labs = HashMap::from([("K".to_string(), 3.5), ("LacticAcid".to_string(), 2.5)]);
-                info!("Charting labs for {}: {:?}", patient_id, labs);
-                agent.update_labs(labs).await?;
-                agent.add_task("Chart labs", 5).await?;
+                info!("Charting labs for {}", patient_id);
+                
+                // Create some sample labs
+                let mut labs = HashMap::new();
+                labs.insert("K".to_string(), 3.2);
+                labs.insert("Na".to_string(), 138.0);
+                labs.insert("Cl".to_string(), 101.0);
+                labs.insert("HCO3".to_string(), 22.0);
+                labs.insert("BUN".to_string(), 25.0);
+                labs.insert("Cr".to_string(), 1.2);
+                labs.insert("Glucose".to_string(), 142.0);
+                labs.insert("LacticAcid".to_string(), 2.8);
+                
+                // Update labs
+                let result = agent.update_labs(labs).await?;
+                info!("Charted labs for {}: {}", patient_id, result);
             }
             Commands::ManageMAR { patient_id } => {
-                let mar = vec![serde_json::json!({"orderId": "ORD001", "medication": "Levophed 0.1 mcg/kg/min", "administeredAt": SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()})];
-                info!("Managing MAR for {}: {:?}", patient_id, mar);
+                info!("Managing MAR for {}", patient_id);
+                
+                // Create some sample medications
+                let mut mar = Vec::new();
+                mar.push(serde_json::json!({
+                    "orderId": "MED001",
+                    "medication": "Levophed 0.1 mcg/kg/min",
+                    "route": "IV",
+                    "frequency": "continuous",
+                    "lastAdministered": chrono::Utc::now().to_rfc3339()
+                }));
+                mar.push(serde_json::json!({
+                    "orderId": "MED002",
+                    "medication": "Insulin Regular 2 units/hr",
+                    "route": "IV",
+                    "frequency": "continuous",
+                    "lastAdministered": chrono::Utc::now().to_rfc3339()
+                }));
+                
+                // Update medications
                 agent.update_medications(mar).await?;
-                agent.add_task("Manage MAR", 5).await?;
+                info!("Updated MAR for {}", patient_id);
             }
             Commands::MonitorBlockchain { patient_id } => {
-                info!("Monitoring blockchain for {}: {}", patient_id, agent.monitor_ehr().await?);
-                agent.add_task("Monitor blockchain", 5).await?;
+                let events = agent.monitor_ehr().await?;
+                info!("Blockchain events for {}: {}", patient_id, events);
             }
             #[cfg(feature = "clickhouse")]
             Commands::TrendVitals { patient_id, key, hours } => {
@@ -1188,27 +1540,99 @@ async fn main() -> Result<(), Error> {
             Commands::TrendMeds { patient_id, medication, hours } => {
                 let hours = hours.unwrap_or(24);
                 let trend = agent.get_meds_trend(&medication, hours).await?;
-                info!("Meds trend for {} ({} over {} hours): {:?}", patient_id, medication, hours, trend);
+                info!("Medications trend for {} ({} over {} hours): {:?}", patient_id, medication, hours, trend);
             }
             #[cfg(feature = "clickhouse")]
             Commands::TrendIO { patient_id, key, hours } => {
                 let hours = hours.unwrap_or(24);
                 let trend = agent.get_io_trend(&key, hours).await?;
-                info!("I/O trend for {} ({} over {} hours): {:?}", patient_id, key, hours, trend);
+                info!("IO trend for {} ({} over {} hours): {:?}", patient_id, key, hours, trend);
             }
         }
+        
         Ok::<(), Error>(())
     };
-
+    
+    // Run the command with or without profiling
     if cli.profile {
         profile(|| {
-            run_command(cli.command).block_on().unwrap_or_else(|e| error!("Command failed: {}", e));
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                if let Err(e) = run_command(cli.command).await {
+                    error!("Error: {}", e);
+                }
+            });
         });
     } else {
-        run_command(cli.command).await?;
+        if let Err(e) = run_command(cli.command).await {
+            error!("Error: {}", e);
+        }
     }
-
+    
     Ok(())
+}
+
+// Metrics endpoint for Prometheus
+async fn start_metrics_server() -> Result<()> {
+    let make_svc = make_service_fn(|_conn| async {
+        Ok::<_, Infallible>(service_fn(|_req: Request<Body>| async {
+            let metrics = PROMETHEUS_HANDLE.get().map(|h| h.render()).unwrap_or_default();
+            Ok::<_, Infallible>(Response::new(Body::from(metrics)))
+        }))
+    });
+    
+    let addr = ([0, 0, 0, 0], 9090).into();
+    Server::bind(&addr).serve(make_svc).await?;
+    
+    Ok(())
+}
+
+// Batch processing helper
+async fn process_batch<T, F, Fut>(items: Vec<T>, concurrency: usize, f: F) -> Result<Vec<Result<(), Error>>>
+where
+    T: Send + 'static,
+    F: Fn(T) -> Fut + Send + Sync + Clone + 'static,
+    Fut: std::future::Future<Output = Result<(), Error>> + Send,
+{
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let f = Arc::new(f);
+    
+    let mut handles = Vec::with_capacity(items.len());
+    
+    for item in items {
+        let permit = semaphore.clone().acquire_owned().await?;
+        let f = f.clone();
+        
+        let handle = tokio::spawn(async move {
+            let result = f(item).await;
+            drop(permit);
+            result
+        });
+        
+        handles.push(handle);
+    }
+    
+    let mut results = Vec::with_capacity(handles.len());
+    for handle in handles {
+        results.push(handle.await?);
+    }
+    
+    Ok(results)
+}
+
+// Retry helper
+async fn with_retry<F, Fut, T, E>(f: F) -> Result<T, E>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let retry_strategy = ExponentialBackoff::from_millis(10)
+        .factor(2)
+        .max_delay(Duration::from_secs(1))
+        .max_retries(3);
+    
+    Retry::spawn(retry_strategy, f).await
 }
 
 mod arc_framework {
@@ -1305,3 +1729,4 @@ mod tools {
             Ok(format!("Results for {}: Normal.", input))
         }
     }
+}
