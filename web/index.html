@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Noah | Intelligent Healthcare Platform</title>
+    
+    <!-- Main stylesheet -->
+    <link rel="stylesheet" href="css/styles.css">
+    
+    <!-- Component styles -->
+    <link rel="stylesheet" href="css/components/login.css">
+    <link rel="stylesheet" href="css/components/patient.css">
+    <link rel="stylesheet" href="css/components/vitals.css">
+    
+    <!-- Default theme (light) -->
+    <link rel="stylesheet" href="css/themes/light.css" id="theme-stylesheet">
+    
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    
+    <link rel="icon" type="image/svg+xml" href="assets/images/favicon.svg">
+</head>
+<body>
+    <!-- Login Screen -->
+    <div id="login-overlay" class="overlay active">
+        <div class="login-container">
+            <div class="login-logo">
+                <svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <circle cx="32" cy="32" r="30" fill="#f8fafc" stroke="#4f46e5" stroke-width="2"/>
+                    <path d="M32 20V44M20 32H44" stroke="#4f46e5" stroke-width="2" stroke-linecap="round"/>
+                </svg>
+                <h1>Noah</h1>
+            </div>
+            <p class="login-tagline">Human-focused healthcare intelligence</p>
+            
+            <form id="login-form" class="login-form">
+                <div class="form-group">
+                    <label for="username">Username</label>
+                    <input type="text" id="username" required autocomplete="username">
+                </div>
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" required autocomplete="current-password">
+                </div>
+                <button type="submit" class="btn btn-primary btn-large">Sign In</button>
+                <div class="login-options">
+                    <a href="#" class="text-link">Forgot password?</a>
+                    <a href="#" class="text-link">Request access</a>
+                </div>
+            </form>
+            
+            <div class="login-footer">
+                <p>HIPAA compliant • Secure authentication</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Application -->
+    <div class="app-container">
+        <header>
+            <div class="logo">
+                <svg width="32" height="32" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <circle cx="32" cy="32" r="30" fill="none" stroke="currentColor" stroke-width="2"/>
+                    <path d="M32 20V44M20 32H44" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                </svg>
+                <span>Noah</span>
+            </div>
+            
+            <nav class="main-nav">
+                <a href="#" class="nav-item active" data-section="ehr">EHR</a>
+                <a href="#" class="nav-item" data-section="analytics">Analytics</a>
+                <a href="#" class="nav-item" data-section="research">Research</a>
+                <a href="#" class="nav-item" data-section="training">Training Data</a>
+                <a href="#" class="nav-item" data-section="docs">Documentation</a>
+            </nav>
+            
+            <div class="controls">
+                <div class="model-selector">
+                    <select id="ai-model">
+                        <option value="noah-core">Noah Core</option>
+                        <option value="noah-pro">Noah Pro</option>
+                        <option value="noah-research">Noah Research</option>
+                        <option value="gpt-4">GPT-4</option>
+                        <option value="claude-3">Claude 3</option>
+                    </select>
+                </div>
+                <button id="user-menu-btn" class="user-menu-btn">
+                    <div class="user-avatar">JS</div>
+                </button>
+            </div>
+        </header>
+
+        <main>
+            <!-- EHR Section -->
+            <section id="ehr-section" class="app-section active">
+                <div class="dashboard">
+                    <section class="patient-list-section">
+                        <div class="section-header">
+                            <h2>Patients</h2>
+                            <button class="btn btn-outline btn-sm">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                    <path d="M12 5V19M5 12H19" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                </svg>
+                                Add
+                            </button>
+                        </div>
+                        <div class="search-container">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <path d="M21 21L15 15M17 10C17 13.866 13.866 17 10 17C6.13401 17 3 13.866 3 10C3 6.13401 6.13401 3 10 3C13.866 3 17 6.13401 17 10Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                            <input type="text" id="patient-search" placeholder="Search patients...">
+                        </div>
+                        <ul id="patient-list" class="patient-list">
+                            <li class="patient-item active" data-patient-id="P001">
+                                <div class="patient-name">John Doe</div>
+                                <div class="patient-mrn">MRN: P001</div>
+                            </li>
+                            <li class="patient-item" data-patient-id="P002">
+                                <div class="patient-name">Jane Smith</div>
+                                <div class="patient-mrn">MRN: P002</div>
+                            </li>
+                            <li class="patient-item" data-patient-id="P003">
+                                <div class="patient-name">Robert Johnson</div>
+                                <div class="patient-mrn">MRN: P003</div>
+                            </li>
+                        </ul>
+                    </section>
+
+                    <section class="patient-detail-section">
+                        <div id="patient-detail" class="patient-detail">
+                            <div class="patient-header">
+                                <div class="patient-info">
+                                    <h3>John Doe</h3>
+                                    <div class="patient-meta">
+                                        <span>MRN: P001</span>
+                                        <span>DOB: 01/15/1975</span>
+                                        <span>Sex: M</span>
+                                    </div>
+                                </div>
+                                <div class="patient-actions">
+                                    <button class="btn btn-outline">
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                            <path d="M12 5V19M5 12H19" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                        </svg>
+                                        Add Note
+                                    </button>
+                                    <button class="btn btn-primary">
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                            <path d="M9 12H15M12 9V15M3 12C3 13.1819 3.23279 14.3522 3.68508 15.4442C4.13738 16.5361 4.80031 17.5282 5.63604 18.364C6.47177 19.1997 7.46392 19.8626 8.55585 20.3149C9.64778 20.7672 10.8181 21 12 21C13.1819 21 14.3522 20.7672 15.4442 20.3149C16.5361 19.8626 17.5282 19.1997 18.364 18.364C19.1997 17.5282 19.8626 16.5361 20.3149 15.4442C20.7672 14.3522 21 13.1819 21 12C21 10.8181 20.7672 9.64778 20.3149 8.55585C19.8626 7.46392 19.1997 6.47177 18.364 5.63604C17.5282 4.80031 16.5361 4.13738 15.4442 3.68508C14.3522 3.23279 13.1819 3 12 3C10.8181 3 9.64778 3.23279 8.55585 3.68508C7.46392 4.13738 6.47177 4.80031 5.63604 5.63604C4.80031 6.47177 4.13738 7.46392 3.68508 8.55585C3.23279 9.64778 3 10.8181 3 12Z" stroke="currentColor" stroke-width="2"/>
+                                        </svg>
+                                        Order Labs
+                                    </button>
+                                </div>
+                            </div>
+                            
+                            <div class="patient-tabs">
+                                <div class="tab active" data-tab="summary">Summary</div>
+                                <div class="tab" data-tab="labs">Labs</div>
+                                <div class="tab" data-tab="meds">Medications</div>
+                                <div class="tab" data-tab="notes">Notes</div>
+                            </div>
+                            
+                            <div class="tab-content active" data-tab="summary">
+                                <div class="vital-summary">
+                                    <div class="vital-summary-grid">
+                                        <div class="vital-summary-item">
+                                            <div class="vital-name">Heart Rate</div>
+                                            <div class="vital-value">72 bpm</div>
+                                            <div class="vital-range">Normal (60-100)</div>
+                                        </div>
+                                        <div class="vital-summary-item">
+                                            <div class="vital-name">Blood Pressure</div>
+                                            <div class="vital-value">120/80 mmHg</div>
+                                            <div class="vital-range">Normal</div>
+                                        </div>
+                                        <div class="vital-summary-item">
+                                            <div class="vital-name">Temperature</div>
+                                            <div class="vital-value">98.6 °F</div>
+                                            <div class="vital-range">Normal (97-99)</div>
+                                        </div>
+                                        <div class="vital-summary-item">
+                                            <div class="vital-name">Respiratory Rate</div>
+                                            <div class="vital-value">16 bpm</div>
+                                            <div class="vital-range">Normal (12-20)</div>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <h4 class="section-title">Recent Activity</h4>
+                                <div class="timeline">
+                                    <div class="timeline-item">
+                                        <div class="timeline-icon">
+                                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                                <path d="M9 12L11 14L15 10M21 12C21 16.9706 16.9706 21 12 21C7.02944 21 3 16.9706 3 12C3 7.02944 7.02944 3 12 3C16.9706 3 21 7.02944 21 12Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                            </svg>
+                                        </div>
+                                        <div class="timeline-content">
+                                            <p class="timeline-time">Today, 10:30 AM</p>
+                                            <p class="timeline-text">Medication administered: Acetaminophen 650mg PO</p>
+                                        </div>
+                                    </div>
+                                    <div class="timeline-item">
+                                        <div class="timeline-icon">
+                                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                                <path d="M9 5H7C5.89543 5 5 5.89543 5 7V19C5 20.1046 5.89543 21 7 21H17C18.1046 21 19 20.1046 19 19V7C19 5.89543 18.1046 5 17 5H15M9 5C9 6.10457 9.89543 7 11 7H13C14.1046 7 15 6.10457 15 5M9 5C9 3.89543 9.89543 3 11 3H13C14.1046 3 15 3.89543 15 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                            </svg>
+                                        </div>
+                                        <div class="timeline-content">
+                                            <p class="timeline-time">Today, 9:15 AM</p>
+                                            <p class="timeline-text">Nursing note added by Jane Smith, RN</p>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+
+                <div class="vitals-monitor">
+                    <div class="section-header">
+                        <h3>Real-time Vitals Monitor</h3>
+                        <div class="section-actions">
+                            <button class="btn btn-text">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                    <path d="M3 4.5H17.25M3 9H12.75M3 13.5H17.25M3 18H12.75M16.5 9L21 13.5M21 9L16.5 13.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                </svg>
+                                Filter
+                            </button>
+                        </div>
+                    </div>
+                    <div id="vitals-container" class="vitals-container">
+                        <div class="vital-card normal">
+                            <div class="vital-name">John Doe</div>
+                            <div class="vital-value">HR: 72 bpm</div>
+                            <div class="vital-range">BP: 120/80 mmHg</div>
+                        </div>
+                        <div class="vital-card warning">
+                            <div class="vital-name">Jane Smith</div>
+                            <div class="vital-value">HR: 95 bpm</div>
+                            <div class="vital-range">BP: 135/85 mmHg</div>
+                        </div>
+                        <div class="vital-card normal">
+                            <div class="vital-name">Robert Johnson</div>
+                            <div class="vital-value">HR: 68 bpm</div>
+                            <div class="vital-range">BP: 118/78 mmHg</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Training Data Section -->
+            <section id="training-section" class="app-section">
+                <div class="section-header">
+                    <h2>Training Data</h2>
+                    <div class="section-actions">
+                        <button class="btn btn-outline">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <path d="M12 5V19M5 12H19" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                            Add Dataset
+                        </button>
+                    </div>
+                </div>
+                
+                <div class="datasets-grid">
+                    <div class="dataset-card">
+                        <div class="dataset-header">
+                            <h3>MIMIC-III Clinical Database</h3>
+                            <span class="badge">40,000 patients</span>
+                        </div>
+                        <p class="dataset-description">
+                            De-identified health data from 40,000 critical care patients. Includes demographics, vital signs, laboratory tests, medications, and more.
+                        </p>
+                        <div class="dataset-meta">
+                            <span>Last updated: 2023-05-15</span>
+                            <span>Format: CSV, SQL</span>
+                        </div>
+                        <div class="dataset-actions">
+                            <button class="btn btn-text">View Details</button>
+                            <button class="btn btn-primary">Use for Training</button>
+                        </div>
+                    </div>
+                    
+                    <div class="dataset-card">
+                        <div class="dataset-header">
+                            <h3>Synthetic EHR Dataset</h3>
+                            <span class="badge">100,000 records</span>
+                        </div>
+                        <p class="dataset-description">
+                            Synthetically generated EHR data with realistic patterns. Includes complete patient journeys with diagnoses, treatments, and outcomes.
+                        </p>
+                        <div class="dataset-meta">
+                            <span>Last updated: 2023-09-22</span>
+                            <span>Format: FHIR, JSON</span>
+                        </div>
+                        <div class="dataset-actions">
+                            <button class="btn btn-text">View Details</button>
+                            <button class="btn btn-primary">Use for Training</button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <div id="notification-container" class="notification-container"></div>
+        
+        <div id="user-menu" class="user-menu">
+            <div class="user-info">
+                <div class="user-avatar large">JS</div>
+                <div class="user-details">
+                    <div class="user-name">Dr. Jane Smith</div>
+                    <div class="user-role">Attending Physician</div>
+                </div>
+            </div>
+            <div class="menu-items">
+                <a href="#" class="menu-item">Profile</a>
+                <a href="#" class="menu-item">Preferences</a>
+                <a href="#" class="menu-item">Help & Support</a>
+                <a href="#" class="menu-item logout">Sign Out</a>
+            </div>
+        </div>
+    </div>
+
+    <!-- Utility scripts -->
+    <script src="js/utils/formatters.js"></script>
+    <script src="js/utils/validators.js"></script>
+    
+    <!-- Component scripts -->
+    <script src="js/components/login.js"></script>
+    <script src="js/components/patient-list.js"></script>
+    <script src="js/components/patient-detail.js"></script>
+    <script src="js/components/vitals-monitor.js"></script>
+    
+    <!-- Main scripts -->
+    <script src="js/api.js"></script>
+    <script src="js/websocket.js"></script>
+    <script src="js/auth.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html> 
